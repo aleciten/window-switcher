@@ -122,16 +122,6 @@ pub struct GdiAAPainter {
 
 impl GdiAAPainter {
     pub fn new(hwnd: HWND, colors: SwitchAppsColors) -> Result<Self> {
-        // GDI+ is still used to rasterize the icon strip.
-        let startup_input = GdiplusStartupInput {
-            GdiplusVersion: 1,
-            ..Default::default()
-        };
-        let mut token: usize = 0;
-        check_error(|| unsafe { GdiplusStartup(&mut token, &startup_input, std::ptr::null_mut()) })
-            .context("Failed to initialize GDI+")?;
-        let hdc_screen = unsafe { GetDC(None) };
-
         // A DispatcherQueue on this (message-loop) thread is required before the
         // Compositor; DQTAT_COM_STA initializes the apartment as STA.
         let dispatcher_controller = unsafe {
@@ -202,6 +192,19 @@ impl GdiAAPainter {
         // Diagnostic: force on to test the host-backdrop blur directly.
         let _ = query_effects_supported(hwnd);
         let effects_supported = true;
+
+        // Acquire the GDI resources last: they are freed by Self's Drop, which only
+        // runs once Self is constructed, so any `?` failure above would otherwise leak
+        // them. GDI+ rasterizes the icon strip; the screen DC backs the per-paint DIB.
+        // Nothing between here and `Ok(Self)` is fallible, so neither can leak.
+        let startup_input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        let mut token: usize = 0;
+        check_error(|| unsafe { GdiplusStartup(&mut token, &startup_input, std::ptr::null_mut()) })
+            .context("Failed to initialize GDI+")?;
+        let hdc_screen = unsafe { GetDC(None) };
 
         Ok(Self {
             hwnd,

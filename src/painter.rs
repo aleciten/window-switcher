@@ -1,4 +1,5 @@
 use crate::app::SwitchAppsState;
+use crate::config::SwitchAppsColors;
 use crate::utils::{check_error, get_moinitor_rect};
 
 use anyhow::{anyhow, Context, Result};
@@ -71,19 +72,8 @@ pub const WINDOW_BORDER_SIZE_BASE: i32 = 16;
 /// Padding around each icon, i.e. the margin between apps in the list.
 pub const ICON_BORDER_SIZE_BASE: i32 = 14;
 
-// Fluent "frosted white" scheme: light grey acrylic + Windows-accent-blue selection.
-/// Acrylic/glass tint (RGB); alpha set by `TINT_ALPHA` (or `TINT_ALPHA_SOLID` fallback).
-const TINT_RGB: (u8, u8, u8) = (0xf3, 0xf3, 0xf3);
-// Translucent frosted tint over the desktop (host-backdrop blur is disabled — it
-// renders opaque black on Win32 desktop windows).
-const TINT_ALPHA: u8 = 0xe0;
-/// Selection highlight (accent blue) drawn into the content surface.
-const SELECTION_RGB: u32 = 0x0067c0;
-const SELECTION_ALPHA: u32 = 0x59;
-/// Fluent elevation border: a diagonal gradient stroke, light at the top-left (lit glass
-/// edges: top + left) and dark at the bottom-right (shadowed edges: bottom + right).
-const BORDER_LIGHT_COLOR: u32 = 0x5cffffff;
-const BORDER_DARK_COLOR: u32 = 0x26000000;
+// The pane background tint, bevel border (light/dark), and selection colors are
+// configurable via the .ini; see `SwitchAppsColors` and its defaults in config.rs.
 /// Border thickness in px @ 96dpi (scaled by DPI).
 const BORDER_WIDTH_BASE: f32 = 1.0;
 /// How far the border softens/blurs inward, in px @ 96dpi (scaled by DPI).
@@ -108,6 +98,7 @@ pub struct GdiAAPainter {
     show: bool,
     effects_supported: bool,
     last_size: (i32, i32),
+    colors: SwitchAppsColors,
 
     // Composition visual tree (resized per paint). The compositor, target and graphics
     // device are held only to keep the tree/surface alive for the renderer's lifetime.
@@ -130,7 +121,7 @@ pub struct GdiAAPainter {
 }
 
 impl GdiAAPainter {
-    pub fn new(hwnd: HWND) -> Result<Self> {
+    pub fn new(hwnd: HWND, colors: SwitchAppsColors) -> Result<Self> {
         // GDI+ is still used to rasterize the icon strip.
         let startup_input = GdiplusStartupInput {
             GdiplusVersion: 1,
@@ -174,7 +165,7 @@ impl GdiAAPainter {
         let backdrop_brush = compositor.CreateHostBackdropBrush()?;
         backdrop.SetBrush(&backdrop_brush)?;
 
-        let tint_brush = compositor.CreateColorBrushWithColor(color(TINT_ALPHA, TINT_RGB))?;
+        let tint_brush = compositor.CreateColorBrushWithColor(argb_color(colors.background))?;
         pane.SetBrush(&tint_brush)?;
 
         let drawing_surface = graphics_device.CreateDrawingSurface(
@@ -196,7 +187,7 @@ impl GdiAAPainter {
 
         // Rounded composition drop shadow, derived from the pane's tinted silhouette.
         let drop_shadow = compositor.CreateDropShadow()?;
-        drop_shadow.SetColor(color(0xff, (0, 0, 0)))?;
+        drop_shadow.SetColor(argb_color(0xff000000))?;
         drop_shadow.SetOpacity(SHADOW_OPACITY)?;
         pane.SetShadow(&drop_shadow)?;
 
@@ -219,6 +210,7 @@ impl GdiAAPainter {
             show: false,
             effects_supported,
             last_size: (0, 0),
+            colors,
             _compositor: compositor,
             _target: target,
             _graphics_device: graphics_device,
@@ -329,7 +321,7 @@ impl GdiAAPainter {
         // layer stays hidden; the pane is a translucent frosted tint over the desktop.
         let _ = self.effects_supported;
         self.backdrop.SetIsVisible(false)?;
-        self.tint_brush.SetColor(color(TINT_ALPHA, TINT_RGB))?;
+        self.tint_brush.SetColor(argb_color(self.colors.background))?;
 
         let si: ICompositionDrawingSurfaceInterop = self.drawing_surface.cast()?;
         unsafe { si.Resize(SIZE { cx: width, cy: height })? };
@@ -349,8 +341,6 @@ impl GdiAAPainter {
         icon_border: i32,
         dpi_scale: f64,
     ) -> Result<()> {
-        let fg_color = SELECTION_RGB;
-
         unsafe {
             // 1) Rasterize the icon row + selection + border into a premultiplied DIB.
             let hdc_mem = CreateCompatibleDC(Some(self.hdc_screen));
@@ -409,8 +399,8 @@ impl GdiAAPainter {
             let blur = BORDER_BLUR_BASE * dpi_scale as f32;
             stroke_round_rect(
                 g,
-                BORDER_LIGHT_COLOR,
-                BORDER_DARK_COLOR,
+                self.colors.border_light,
+                self.colors.border_dark,
                 inset,
                 inset,
                 w - 2.0 * inset,
@@ -426,7 +416,7 @@ impl GdiAAPainter {
             let sel_radius = (item_size as f32 / 4.0).min(8.0 * dpi_scale as f32);
             fill_round_rect(
                 g,
-                (SELECTION_ALPHA << 24) | fg_color,
+                self.colors.selection,
                 sel_left,
                 sel_top,
                 item_size as f32,
@@ -575,8 +565,14 @@ impl Drop for GdiAAPainter {
     }
 }
 
-fn color(a: u8, (r, g, b): (u8, u8, u8)) -> Color {
-    Color { A: a, R: r, G: g, B: b }
+/// Converts a packed `0xAARRGGBB` value into a composition `Color`.
+fn argb_color(argb: u32) -> Color {
+    Color {
+        A: (argb >> 24) as u8,
+        R: (argb >> 16) as u8,
+        G: (argb >> 8) as u8,
+        B: argb as u8,
+    }
 }
 
 /// Creates a hardware D3D11 device (with BGRA support for D2D), falling back to WARP.

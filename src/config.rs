@@ -13,6 +13,36 @@ pub const SWITCH_APPS_HOTKEY_ID: u32 = 2;
 
 const DEFAULT_CONFIG: &str = include_str!("../window-switcher.ini");
 
+// Default overlay colors (ARGB), matching the renderer's built-in look.
+pub const DEFAULT_BACKGROUND_COLOR: u32 = 0xe0f3f3f3;
+pub const DEFAULT_BORDER_LIGHT_COLOR: u32 = 0x5cffffff;
+pub const DEFAULT_BORDER_DARK_COLOR: u32 = 0x26000000;
+pub const DEFAULT_SELECTION_COLOR: u32 = 0x590067c0;
+
+/// Configurable colors for the switch-apps overlay (ARGB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchAppsColors {
+    /// Frosted background tint of the pane.
+    pub background: u32,
+    /// Lit bevel edge (top + left).
+    pub border_light: u32,
+    /// Shadowed bevel edge (bottom + right).
+    pub border_dark: u32,
+    /// Highlight behind the selected app (the cursor).
+    pub selection: u32,
+}
+
+impl Default for SwitchAppsColors {
+    fn default() -> Self {
+        Self {
+            background: DEFAULT_BACKGROUND_COLOR,
+            border_light: DEFAULT_BORDER_LIGHT_COLOR,
+            border_dark: DEFAULT_BORDER_DARK_COLOR,
+            selection: DEFAULT_SELECTION_COLOR,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub trayicon: bool,
@@ -27,6 +57,7 @@ pub struct Config {
     pub switch_apps_ignore_minimal: bool,
     pub switch_apps_override_icons: IndexMap<String, String>,
     switch_apps_only_current_desktop: Option<bool>,
+    pub switch_apps_colors: SwitchAppsColors,
 }
 
 impl Default for Config {
@@ -54,6 +85,7 @@ impl Default for Config {
             switch_apps_ignore_minimal: false,
             switch_apps_override_icons: Default::default(),
             switch_apps_only_current_desktop: None,
+            switch_apps_colors: SwitchAppsColors::default(),
         }
     }
 }
@@ -137,6 +169,19 @@ impl Config {
                 .and_then(Config::to_bool)
             {
                 conf.switch_apps_only_current_desktop = Some(v);
+            }
+
+            if let Some(v) = section.get("background_color").and_then(parse_color) {
+                conf.switch_apps_colors.background = v;
+            }
+            if let Some(v) = section.get("border_light_color").and_then(parse_color) {
+                conf.switch_apps_colors.border_light = v;
+            }
+            if let Some(v) = section.get("border_dark_color").and_then(parse_color) {
+                conf.switch_apps_colors.border_dark = v;
+            }
+            if let Some(v) = section.get("selection_color").and_then(parse_color) {
+                conf.switch_apps_colors.selection = v;
             }
         }
         Ok(conf)
@@ -362,6 +407,18 @@ fn normalize_path_value(value: &str) -> String {
     value.replace("\\\\", "\\")
 }
 
+/// Parses a hex color into an ARGB `u32`. Accepts `RRGGBB` (opaque) or `AARRGGBB`,
+/// with an optional leading `#`.
+fn parse_color(value: &str) -> Option<u32> {
+    let s = value.trim().trim_start_matches('#');
+    let v = u32::from_str_radix(s, 16).ok()?;
+    match s.len() {
+        6 => Some(0xff00_0000 | v),
+        8 => Some(v),
+        _ => None,
+    }
+}
+
 fn parse_hotkeys(id: u32, name: &str, value: &str) -> Result<Vec<Hotkey>> {
     let parts: Vec<&str> = value.split("||").collect();
     let mut hotkeys = vec![];
@@ -401,5 +458,15 @@ mod tests {
         assert_eq!(hotkeys.len(), 1);
         assert_eq!(hotkeys[0].modifier, [0x38, 0x38]);
         assert_eq!(hotkeys[0].code, 0x29);
+    }
+
+    #[test]
+    fn test_parse_color() {
+        assert_eq!(parse_color("e0f3f3f3"), Some(0xe0f3f3f3));
+        assert_eq!(parse_color("#590067c0"), Some(0x590067c0));
+        assert_eq!(parse_color("0067c0"), Some(0xff0067c0)); // RGB => opaque
+        assert_eq!(parse_color("  #ff0000ff  "), Some(0xff0000ff));
+        assert_eq!(parse_color("xyz"), None);
+        assert_eq!(parse_color("12345"), None); // wrong length
     }
 }

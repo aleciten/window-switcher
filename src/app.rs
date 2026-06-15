@@ -60,7 +60,7 @@ pub struct App {
 impl App {
     pub fn start(config: &Config) -> Result<()> {
         let hwnd = Self::create_window()?;
-        let painter = GdiAAPainter::new(hwnd)?;
+        let painter = GdiAAPainter::new(hwnd, config.switch_apps_colors)?;
 
         let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
         let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;

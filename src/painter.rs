@@ -86,6 +86,10 @@ pub const ROW_ICON_SIZE_BASE: i32 = 24;
 pub const ROW_HEIGHT_BASE: i32 = 36;
 /// Horizontal padding around the icon / between icon and text / trailing the text.
 pub const ROW_TEXT_PAD_BASE: i32 = 10;
+/// Margin between the popup pane edge and the row list (smaller than the app row's border).
+pub const POPUP_BORDER_BASE: i32 = 6;
+/// Vertical gap above/below the selection highlight within a row.
+const ROW_SEL_INSET_BASE: i32 = 2;
 /// Font em-size (UnitPixel) for the window titles.
 const FONT_SIZE_BASE: f32 = 14.0;
 /// Min / max popup width clamp, in px @ 96dpi.
@@ -657,17 +661,19 @@ impl WindowsPainter {
         let dpi_scale = get_dpi_scale(overlay.hwnd());
         self.ensure_font(dpi_scale);
 
-        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border = (POPUP_BORDER_BASE as f64 * dpi_scale) as i32;
         let row_height = (ROW_HEIGHT_BASE as f64 * dpi_scale) as i32;
         let row_icon = (ROW_ICON_SIZE_BASE as f64 * dpi_scale) as i32;
         let pad = (ROW_TEXT_PAD_BASE as f64 * dpi_scale) as i32;
+        let sel_inset = (ROW_SEL_INSET_BASE as f64 * dpi_scale).round() as i32;
 
-        // Left edge of the title text column: border + pad + icon + pad.
-        let text_left = border_size + pad + row_icon + pad;
+        // Horizontal bands within a row: [border][pad][icon][pad][title][pad][border].
+        // The title column is bounded so the text never spills past the selection highlight.
+        let text_left = border + pad + row_icon + pad;
         let measured = unsafe { self.measure_titles_width(&state.items) };
         let min_w = (POPUP_MIN_WIDTH_BASE as f64 * dpi_scale) as i32;
         let max_w = (POPUP_MAX_WIDTH_BASE as f64 * dpi_scale) as i32;
-        let width = (text_left + measured + pad).clamp(min_w, max_w);
+        let width = (text_left + measured + pad + border).clamp(min_w, max_w);
 
         let margin = Overlay::shadow_margin(dpi_scale);
         let VCoordinate {
@@ -681,7 +687,7 @@ impl WindowsPainter {
             state.items.len(),
             state.index,
             width,
-            border_size,
+            border,
             row_height,
             margin,
         );
@@ -700,19 +706,18 @@ impl WindowsPainter {
             for row in 0..visible_rows {
                 let idx = first_visible + row;
                 let (icon, _, title) = &items[idx];
-                let row_top = border_size + row_height * row as i32;
+                let row_top = border + row_height * row as i32;
 
-                // Selection highlight behind the current row.
+                // Selection highlight behind the current row (spans the inner pane width).
                 if idx == sel_index {
-                    let inset = (3.0 * dpi_scale).round() as i32;
                     let sel_radius = 6.0 * dpi_scale as f32;
                     fill_round_rect(
                         g,
                         colors.selection,
-                        (border_size + inset) as f32,
-                        (row_top + inset) as f32,
-                        (width - 2 * (border_size + inset)) as f32,
-                        (row_height - 2 * inset) as f32,
+                        border as f32,
+                        (row_top + sel_inset) as f32,
+                        (width - 2 * border) as f32,
+                        (row_height - 2 * sel_inset) as f32,
                         sel_radius,
                     );
                 }
@@ -731,7 +736,7 @@ impl WindowsPainter {
                     .0 == 0
                         && !icon_ptr.is_null()
                     {
-                        let ix = border_size + pad;
+                        let ix = border + pad;
                         let iy = row_top + (row_height - row_icon) / 2;
                         GdipDrawImageRectI(g, icon_ptr as *mut GpImage, ix, iy, row_icon, row_icon);
                         GdipDisposeImage(icon_ptr as *mut GpImage);
@@ -739,7 +744,8 @@ impl WindowsPainter {
                     drop(buf);
                 }
 
-                // Window title (left-aligned, vertically centered, ellipsized).
+                // Window title (left-aligned, vertically centered, ellipsized). The right edge
+                // stops `pad` inside the selection so text never spills past the highlight.
                 if !font.is_null() && !fmt.is_null() {
                     let wide: Vec<u16> = title.encode_utf16().collect();
                     let mut brush: *mut GpSolidFill = std::ptr::null_mut();
@@ -747,7 +753,7 @@ impl WindowsPainter {
                     let rect = RectF {
                         X: text_left as f32,
                         Y: row_top as f32,
-                        Width: (width - text_left - pad) as f32,
+                        Width: (width - border - pad - text_left) as f32,
                         Height: row_height as f32,
                     };
                     GdipDrawString(

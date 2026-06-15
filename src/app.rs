@@ -542,9 +542,11 @@ impl App {
                 )
             });
 
+        let titles = strip_app_name(app_windows.iter().map(|(_, t)| t.as_str()));
         let items: Vec<(HICON, HWND, String)> = app_windows
             .iter()
-            .map(|(id, title)| (module_hicon, *id, truncate_title(title)))
+            .zip(titles)
+            .map(|((id, _), title)| (module_hicon, *id, truncate_title(&title)))
             .collect();
         if items.is_empty() {
             return Ok(());
@@ -558,7 +560,11 @@ impl App {
             1
         };
 
-        self.switch_app_windows_state = Some(SwitchAppWindowsState { items, index });
+        self.switch_app_windows_state = Some(SwitchAppWindowsState {
+            items,
+            index,
+            origin: foreground,
+        });
         debug!(
             "switch app windows, new state:{:?}",
             self.switch_app_windows_state
@@ -577,10 +583,47 @@ impl App {
     }
 
     fn cancel_switch_app_window(&mut self) {
-        if self.switch_app_windows_state.take().is_some() {
+        if let Some(state) = self.switch_app_windows_state.take() {
+            // Restore focus to where it was: showing the popup can shift the foreground,
+            // so ESC must explicitly return to the originally-focused window.
+            set_foreground_window(state.origin);
             self.overlay.hide();
         }
     }
+}
+
+/// Strips the trailing " - <app name>" that Windows appends to window titles (e.g.
+/// "config.rs - window-switcher - Visual Studio Code" -> "config.rs - window-switcher").
+/// With several windows we remove only the trailing segment(s) common to ALL of them —
+/// reliably the app name — never stripping a title down to nothing. With a single window
+/// we drop just the last " - " segment.
+fn strip_app_name<'a>(titles: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    const SEP: &str = " - ";
+    let parts: Vec<Vec<&str>> = titles.into_iter().map(|t| t.split(SEP).collect()).collect();
+    let min_len = parts.iter().map(|p| p.len()).min().unwrap_or(0);
+
+    // Count trailing segments shared by every title (the app name, possibly multi-word).
+    let mut common = 0;
+    if parts.len() > 1 {
+        while common + 1 < min_len {
+            let seg = parts[0][parts[0].len() - 1 - common];
+            if parts.iter().all(|p| p[p.len() - 1 - common] == seg) {
+                common += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    // Single window: drop just the last segment. Multiple: drop the common suffix.
+    let drop = if parts.len() == 1 { 1 } else { common };
+
+    parts
+        .iter()
+        .map(|p| {
+            let keep = p.len().saturating_sub(drop).max(1);
+            p[..keep].join(SEP)
+        })
+        .collect()
 }
 
 /// Caps a window title to a sane length for the popup (counted in chars, not bytes).
@@ -629,4 +672,51 @@ pub struct SwitchAppWindowsState {
     /// Each row: the (shared) app icon, the window handle, and its title.
     pub items: Vec<(HICON, HWND, String)>,
     pub index: usize,
+    /// The foreground window when the popup opened, restored on cancel.
+    pub origin: HWND,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_app_name;
+
+    #[test]
+    fn strips_common_app_name_across_windows() {
+        let out = strip_app_name([
+            "Create plan - guitar-practice-app - Visual Studio Code",
+            "deploy.ps1 - configs - Visual Studio Code",
+            "config.rs - window-switcher - Visual Studio Code",
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                "Create plan - guitar-practice-app",
+                "deploy.ps1 - configs",
+                "config.rs - window-switcher",
+            ]
+        );
+    }
+
+    #[test]
+    fn strips_multiword_app_suffix() {
+        // The shared suffix may span several " - " segments.
+        let out = strip_app_name(["doc1 - Foo - Bar", "doc2 - Foo - Bar"]);
+        assert_eq!(out, vec!["doc1", "doc2"]);
+    }
+
+    #[test]
+    fn single_window_drops_last_segment() {
+        let out = strip_app_name(["config.rs - window-switcher - Visual Studio Code"]);
+        assert_eq!(out, vec!["config.rs - window-switcher"]);
+    }
+
+    #[test]
+    fn keeps_titles_without_separator() {
+        assert_eq!(strip_app_name(["Claude"]), vec!["Claude"]);
+        // Nothing common to strip, and never reduce a title to empty.
+        assert_eq!(
+            strip_app_name(["Claude", "Settings - Claude"]),
+            vec!["Claude", "Settings - Claude"]
+        );
+    }
 }

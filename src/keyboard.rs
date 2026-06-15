@@ -146,8 +146,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
                 if is_mod2 {
                     state.is_modifier2_pressed = false;
                 }
-                // Releasing ANY required modifier commits the gesture.
-                if PREVIOUS_KEYCODE == state.hotkey.code {
+                // Commit only when the LAST chord modifier is released. For a two-modifier
+                // chord (Alt+Ctrl), releasing just one keeps the popup open, so the user can
+                // let go of either on the way to pressing Esc to cancel.
+                let any_still_held = state.is_modifier_pressed || state.is_modifier2_pressed;
+                if !any_still_held && PREVIOUS_KEYCODE == state.hotkey.code {
                     send_done_hotkeys.insert(state.hotkey.id);
                 }
             }
@@ -155,39 +158,47 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     }
     if !is_modifier {
         for state in keyboard_state.iter_mut() {
-            if is_key_pressed() && state.held() {
-                let id = state.hotkey.id;
-                if scan_code == state.hotkey.code {
-                    let reverse = if IS_SHIFT_PRESSED { 1 } else { 0 };
-                    if id == SWITCH_APPS_HOTKEY_ID
-                        || id == SWITCH_APP_WINDOWS_HOTKEY_ID
-                        || (id == SWITCH_WINDOWS_HOTKEY_ID && !IS_FOREGROUND_IN_BLACKLIST)
-                    {
-                        send_action_message = Some((id, reverse, false));
-                        PREVIOUS_KEYCODE = scan_code;
-                        break;
-                    };
-                } else if id == SWITCH_APPS_HOTKEY_ID || id == SWITCH_APP_WINDOWS_HOTKEY_ID {
-                    let is_switching = if id == SWITCH_APPS_HOTKEY_ID {
-                        IS_SWITCHING_APPS
+            // The popup stays alive while EITHER chord modifier is held, so Esc/arrows work
+            // even after the user lets go of one of them. Opening / hotkey-key navigation
+            // still needs the full chord (checked via `held()` below).
+            let any_mod_held = state.is_modifier_pressed || state.is_modifier2_pressed;
+            if !is_key_pressed() || !any_mod_held {
+                continue;
+            }
+            let id = state.hotkey.id;
+            if scan_code == state.hotkey.code && state.held() {
+                let reverse = if IS_SHIFT_PRESSED { 1 } else { 0 };
+                if id == SWITCH_APPS_HOTKEY_ID
+                    || id == SWITCH_APP_WINDOWS_HOTKEY_ID
+                    || (id == SWITCH_WINDOWS_HOTKEY_ID && !IS_FOREGROUND_IN_BLACKLIST)
+                {
+                    send_action_message = Some((id, reverse, false));
+                    PREVIOUS_KEYCODE = scan_code;
+                    break;
+                };
+            } else if id == SWITCH_APPS_HOTKEY_ID || id == SWITCH_APP_WINDOWS_HOTKEY_ID {
+                let is_switching = if id == SWITCH_APPS_HOTKEY_ID {
+                    IS_SWITCHING_APPS
+                } else {
+                    IS_SWITCHING_APP_WINDOWS
+                };
+                if !is_switching {
+                    continue;
+                }
+                if scan_code == 0x01 {
+                    // escape key — cancel the active popup
+                    send_action_message = Some((id, 0, true));
+                    PREVIOUS_KEYCODE = scan_code;
+                    break;
+                } else if [0x48, 0x4b, 0x4d, 0x50].contains(&scan_code) {
+                    // arrow keys
+                    let reverse = if scan_code == 0x48 || scan_code == 0x4b {
+                        1
                     } else {
-                        IS_SWITCHING_APP_WINDOWS
+                        0
                     };
-                    if scan_code == 0x01 {
-                        // escape key
-                        send_action_message = Some((id, 0, true));
-                        PREVIOUS_KEYCODE = scan_code;
-                        break;
-                    } else if [0x48, 0x4b, 0x4d, 0x50].contains(&scan_code) && is_switching {
-                        // arrow keys
-                        let reverse = if scan_code == 0x48 || scan_code == 0x4b {
-                            1
-                        } else {
-                            0
-                        };
-                        send_action_message = Some((id, reverse, false));
-                        break;
-                    }
+                    send_action_message = Some((id, reverse, false));
+                    break;
                 }
             }
         }

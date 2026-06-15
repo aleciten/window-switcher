@@ -80,8 +80,14 @@ const TINT_ALPHA: u8 = 0xe0;
 /// Selection highlight (accent blue) drawn into the content surface.
 const SELECTION_RGB: u32 = 0x0067c0;
 const SELECTION_ALPHA: u32 = 0x59;
-/// Subtle 1px inner "glass rim" highlight (ARGB white) drawn into the content surface.
-const BORDER_COLOR: u32 = 0x3affffff;
+/// Fluent elevation border: a diagonal gradient stroke, light at the top-left (lit glass
+/// edges: top + left) and dark at the bottom-right (shadowed edges: bottom + right).
+const BORDER_LIGHT_COLOR: u32 = 0x5cffffff;
+const BORDER_DARK_COLOR: u32 = 0x26000000;
+/// Border thickness in px @ 96dpi (scaled by DPI).
+const BORDER_WIDTH_BASE: f32 = 1.0;
+/// How far the border softens/blurs inward, in px @ 96dpi (scaled by DPI).
+const BORDER_BLUR_BASE: f32 = 2.5;
 
 /// Corner radius / shadow geometry, in px @ 96dpi (scaled by DPI at paint time).
 const CORNER_RADIUS_BASE: f32 = 8.0;
@@ -393,20 +399,25 @@ impl GdiAAPainter {
 
             // Rounded 1px stroke that follows the pane's rounded corners (a rectangular
             // border would be clipped at the corners by the composition rounded clip).
-            let stroke = (dpi_scale.round() as f32).max(1.0);
+            let pen_width = (BORDER_WIDTH_BASE * dpi_scale as f32).max(1.0);
             let w = width as f32;
             let h = height as f32;
-            let inset = stroke; // inner rim: keep the whole stroke inside the rounded clip
+            // Centered stroke inset by half its width so its OUTER edge sits flush on the
+            // pane edge (no sliver of tint showing outside the border).
+            let inset = pen_width * 0.5;
             let corner = CORNER_RADIUS_BASE * dpi_scale as f32;
+            let blur = BORDER_BLUR_BASE * dpi_scale as f32;
             stroke_round_rect(
                 g,
-                BORDER_COLOR,
+                BORDER_LIGHT_COLOR,
+                BORDER_DARK_COLOR,
                 inset,
                 inset,
                 w - 2.0 * inset,
                 h - 2.0 * inset,
                 (corner - inset).max(0.0),
-                stroke,
+                pen_width,
+                blur,
             );
 
             // Rounded selection highlight behind the selected app.
@@ -601,33 +612,69 @@ fn query_effects_supported(hwnd: HWND) -> Result<bool> {
     Ok(caps.AreEffectsSupported()?)
 }
 
-/// Strokes an antialiased rounded-rectangle outline with a solid ARGB color (GDI+).
+/// Strokes a beveled rounded-rectangle outline: the top + left edges (and top-left corner)
+/// in `light_color`, the bottom + right edges (and bottom-right corner) in `dark_color`,
+/// splitting the two off-corners at 45°. Gives the panel a sense of depth (lit top-left).
+#[allow(clippy::too_many_arguments)]
 unsafe fn stroke_round_rect(
     g: *mut GpGraphics,
-    color_argb: u32,
+    light_color: u32,
+    dark_color: u32,
     left: f32,
     top: f32,
     w: f32,
     h: f32,
     radius: f32,
     pen_width: f32,
+    blur: f32,
 ) {
     unsafe {
         let d = radius * 2.0;
         let right = left + w;
         let bottom = top + h;
-        let mut pen: *mut GpPen = std::ptr::null_mut();
-        GdipCreatePen1(color_argb, pen_width, Unit(2), &mut pen); // Unit(2) = pixels
-        let mut path: *mut GpPath = std::ptr::null_mut();
-        GdipCreatePath(FillModeAlternate, &mut path);
-        GdipAddPathArc(path, left, top, d, d, 180.0, 90.0);
-        GdipAddPathArc(path, right - d, top, d, d, 270.0, 90.0);
-        GdipAddPathArc(path, right - d, bottom - d, d, d, 0.0, 90.0);
-        GdipAddPathArc(path, left, bottom - d, d, d, 90.0, 90.0);
-        GdipClosePathFigure(path);
-        GdipDrawPath(g, pen, path);
-        GdipDeletePath(path);
-        GdipDeletePen(pen);
+
+        // Light "L": bottom-left corner (from its 45° midpoint) up the left edge, around the
+        // top-left corner, across the top edge, to the top-right corner's 45° midpoint.
+        let mut light_path: *mut GpPath = std::ptr::null_mut();
+        GdipCreatePath(FillModeAlternate, &mut light_path);
+        GdipAddPathArc(light_path, left, bottom - d, d, d, 135.0, 45.0);
+        GdipAddPathArc(light_path, left, top, d, d, 180.0, 90.0);
+        GdipAddPathArc(light_path, right - d, top, d, d, 270.0, 45.0);
+        stroke_path_soft(g, light_path, light_color, pen_width, blur);
+        GdipDeletePath(light_path);
+
+        // Dark "L": top-right 45° midpoint, down the right edge, around the bottom-right
+        // corner, across the bottom edge, to the bottom-left corner's 45° midpoint.
+        let mut dark_path: *mut GpPath = std::ptr::null_mut();
+        GdipCreatePath(FillModeAlternate, &mut dark_path);
+        GdipAddPathArc(dark_path, right - d, top, d, d, 315.0, 45.0);
+        GdipAddPathArc(dark_path, right - d, bottom - d, d, d, 0.0, 90.0);
+        GdipAddPathArc(dark_path, left, bottom - d, d, d, 90.0, 45.0);
+        stroke_path_soft(g, dark_path, dark_color, pen_width, blur);
+        GdipDeletePath(dark_path);
+    }
+}
+
+/// Strokes a path several times — a wide faint pass plus narrower stronger ones — to fake
+/// a soft, blurred edge instead of a hard 1px line.
+unsafe fn stroke_path_soft(
+    g: *mut GpGraphics,
+    path: *mut GpPath,
+    color_argb: u32,
+    core_width: f32,
+    blur: f32,
+) {
+    unsafe {
+        let rgb = color_argb & 0x00ff_ffff;
+        let base_a = ((color_argb >> 24) & 0xff) as f32;
+        // (extra width, alpha factor), widest+faintest first so the core lands on top.
+        for (extra, factor) in [(blur * 2.0, 0.22f32), (blur, 0.45), (0.0, 1.0)] {
+            let a = (base_a * factor).round() as u32;
+            let mut pen: *mut GpPen = std::ptr::null_mut();
+            GdipCreatePen1((a << 24) | rgb, core_width + extra, Unit(2), &mut pen);
+            GdipDrawPath(g, pen, path);
+            GdipDeletePen(pen);
+        }
     }
 }
 

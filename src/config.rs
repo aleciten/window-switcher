@@ -44,7 +44,7 @@ impl Default for Config {
             switch_windows_blacklist: Default::default(),
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
-            switch_apps_enable: false,
+            switch_apps_enable: true,
             switch_apps_hotkey: vec![Hotkey::create(
                 SWITCH_APPS_HOTKEY_ID,
                 "switch apps",

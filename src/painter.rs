@@ -1,57 +1,131 @@
 use crate::app::SwitchAppsState;
-use crate::utils::{check_error, get_moinitor_rect, is_light_theme, is_win11};
+use crate::utils::{check_error, get_moinitor_rect};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use std::ffi::c_void;
+use std::mem::ManuallyDrop;
+use windows::core::Interface;
+use windows::Foundation::Size;
+use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
+use windows::System::DispatcherQueueController;
+use windows::UI::Color;
+use windows::UI::Composition::Desktop::DesktopWindowTarget;
+use windows::UI::Composition::{
+    CompositionCapabilities, CompositionColorBrush, CompositionDrawingSurface,
+    CompositionGraphicsDevice, Compositor, ContainerVisual, DropShadow,
+    CompositionRoundedRectangleGeometry, SpriteVisual,
+};
 use windows::Win32::{
-    Foundation::{COLORREF, HWND, POINT, RECT, SIZE},
+    Foundation::{HMODULE, HWND, POINT, SIZE},
     Graphics::{
+        Direct2D::{
+            Common::{
+                D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+            },
+            D2D1CreateDevice, ID2D1Device, ID2D1DeviceContext, D2D1_BITMAP_OPTIONS_NONE,
+            D2D1_BITMAP_PROPERTIES1, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_PRIMITIVE_BLEND_COPY,
+        },
+        Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
+        Direct3D11::{
+            D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        },
+        Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice},
         Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush,
-            DeleteDC, DeleteObject, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject,
-            SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HALFTONE,
-            HBITMAP, HDC, HPALETTE, SRCCOPY,
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
+            GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS, HDC,
         },
         GdiPlus::{
-            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateBitmapFromHBITMAP,
-            GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipDeleteBrush, GdipDeleteGraphics,
-            GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawImageRect, GdipFillPath,
-            GdipFillRectangle, GdipGetPenBrushFill, GdipSetInterpolationMode, GdipSetSmoothingMode,
+            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateBitmapFromScan0,
+            GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush,
+            GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawImageRectI,
+            GdipDrawPath, GdipFillPath, GdipGetImageGraphicsContext, GdipGraphicsClear,
+            GdipSetInterpolationMode, GdipSetPixelOffsetMode, GdipSetSmoothingMode,
             GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpGraphics,
-            GpImage, GpPath, GpPen, InterpolationModeHighQualityBicubic, SmoothingModeAntiAlias,
-            Unit,
+            GpImage, GpPath, GpPen, GpSolidFill, InterpolationModeHighQualityBicubic,
+            PixelOffsetModeHighQuality, SmoothingModeAntiAlias, Unit,
         },
+    },
+    System::WinRT::{
+        Composition::{
+            ICompositionCapabilitiesInteropFactory, ICompositionDrawingSurfaceInterop,
+            ICompositorDesktopInterop, ICompositorInterop,
+        },
+        CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA,
+        DQTYPE_THREAD_CURRENT,
     },
     UI::{
         HiDpi::GetDpiForWindow,
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
-            DrawIconEx, GetCursorPos, ShowWindow, UpdateLayeredWindow, DI_NORMAL, SW_HIDE, SW_SHOW,
-            ULW_ALPHA,
+            GetCursorPos, GetIconInfo, SetWindowPos, ShowWindow, HICON, HWND_TOPMOST, ICONINFO,
+            SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
         },
     },
 };
+use windows_numerics::{Vector2, Vector3};
 
-pub const BG_DARK_COLOR: u32 = 0x4c4c4c;
-pub const FG_DARK_COLOR: u32 = 0x3b3b3b;
-pub const BG_LIGHT_COLOR: u32 = 0xe0e0e0;
-pub const FG_LIGHT_COLOR: u32 = 0xf2f2f2;
-pub const ALPHA_MASK: u32 = 0xff000000;
 pub const ICON_SIZE_BASE: i32 = 64;
-pub const WINDOW_BORDER_SIZE_BASE: i32 = 10;
-pub const ICON_BORDER_SIZE_BASE: i32 = 4;
-pub const SCALE_FACTOR: i32 = 6;
+/// Margin between the pane edge and the icon list.
+pub const WINDOW_BORDER_SIZE_BASE: i32 = 16;
+/// Padding around each icon, i.e. the margin between apps in the list.
+pub const ICON_BORDER_SIZE_BASE: i32 = 14;
 
-// GDI Antialiasing Painter
+// Fluent "frosted white" scheme: light grey acrylic + Windows-accent-blue selection.
+/// Acrylic/glass tint (RGB); alpha set by `TINT_ALPHA` (or `TINT_ALPHA_SOLID` fallback).
+const TINT_RGB: (u8, u8, u8) = (0xf3, 0xf3, 0xf3);
+// Translucent frosted tint over the desktop (host-backdrop blur is disabled — it
+// renders opaque black on Win32 desktop windows).
+const TINT_ALPHA: u8 = 0xe0;
+/// Selection highlight (accent blue) drawn into the content surface.
+const SELECTION_RGB: u32 = 0x0067c0;
+const SELECTION_ALPHA: u32 = 0x59;
+/// Subtle 1px inner "glass rim" highlight (ARGB white) drawn into the content surface.
+const BORDER_COLOR: u32 = 0x3affffff;
+
+/// Corner radius / shadow geometry, in px @ 96dpi (scaled by DPI at paint time).
+const CORNER_RADIUS_BASE: f32 = 8.0;
+const SHADOW_BLUR_BASE: f32 = 18.0;
+const SHADOW_OFFSET_Y_BASE: f32 = 3.0;
+const SHADOW_OPACITY: f32 = 0.5;
+
+/// 32bpp premultiplied ARGB, the format the GDI+ strip rasterizer produces.
+const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000e200b;
+
+/// Windows.UI.Composition renderer for the Alt+Tab overlay: a host-backdrop acrylic
+/// pane with rounded corners and a real composition drop shadow. The icon row is
+/// rasterized with GDI+ and uploaded into a composition drawing surface.
 pub struct GdiAAPainter {
-    token: usize,
     hwnd: HWND,
     hdc_screen: HDC,
-    rounded_corner: bool,
+    token: usize, // GdiplusStartup token
     show: bool,
+    effects_supported: bool,
+    last_size: (i32, i32),
+
+    // Composition visual tree (resized per paint). The compositor, target and graphics
+    // device are held only to keep the tree/surface alive for the renderer's lifetime.
+    _compositor: Compositor,
+    _target: DesktopWindowTarget,
+    _graphics_device: CompositionGraphicsDevice,
+    drawing_surface: CompositionDrawingSurface,
+    root: ContainerVisual,
+    backdrop: SpriteVisual,
+    pane: SpriteVisual,
+    content: SpriteVisual,
+    rounded_geo: CompositionRoundedRectangleGeometry,
+    drop_shadow: DropShadow,
+    tint_brush: CompositionColorBrush,
+
+    // Kept alive for the lifetime of the renderer (declared so they drop last).
+    _d3d_device: ID3D11Device,
+    _d2d_device: ID2D1Device,
+    _dispatcher_controller: DispatcherQueueController,
 }
 
 impl GdiAAPainter {
     pub fn new(hwnd: HWND) -> Result<Self> {
+        // GDI+ is still used to rasterize the icon strip.
         let startup_input = GdiplusStartupInput {
             GdiplusVersion: 1,
             ..Default::default()
@@ -59,16 +133,100 @@ impl GdiAAPainter {
         let mut token: usize = 0;
         check_error(|| unsafe { GdiplusStartup(&mut token, &startup_input, std::ptr::null_mut()) })
             .context("Failed to initialize GDI+")?;
+        let hdc_screen = unsafe { GetDC(None) };
 
-        let hdc_screen = unsafe { GetDC(Some(hwnd)) };
-        let rounded_corner = is_win11();
+        // A DispatcherQueue on this (message-loop) thread is required before the
+        // Compositor; DQTAT_COM_STA initializes the apartment as STA.
+        let dispatcher_controller = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_STA,
+            })
+        }
+        .context("Failed to create dispatcher queue controller")?;
+
+        let compositor = Compositor::new().context("Failed to create compositor")?;
+
+        // D3D11 -> DXGI -> D2D device, then a composition graphics device.
+        let d3d_device = create_d3d_device().context("Failed to create D3D11 device")?;
+        let dxgi: IDXGIDevice = d3d_device.cast()?;
+        let d2d_device = unsafe { D2D1CreateDevice(&dxgi, None) }?;
+        let comp_interop: ICompositorInterop = compositor.cast()?;
+        let graphics_device = unsafe { comp_interop.CreateGraphicsDevice(&d2d_device) }?;
+
+        // Host the visual tree on the window.
+        let desktop_interop: ICompositorDesktopInterop = compositor.cast()?;
+        let target = unsafe { desktop_interop.CreateDesktopWindowTarget(hwnd, true) }?;
+
+        // Build the tree:  root -> [ backdrop (blur), pane (tint + shadow) -> content (icons) ]
+        let root = compositor.CreateContainerVisual()?;
+        let backdrop = compositor.CreateSpriteVisual()?;
+        let pane = compositor.CreateSpriteVisual()?;
+        let content = compositor.CreateSpriteVisual()?;
+
+        let backdrop_brush = compositor.CreateHostBackdropBrush()?;
+        backdrop.SetBrush(&backdrop_brush)?;
+
+        let tint_brush = compositor.CreateColorBrushWithColor(color(TINT_ALPHA, TINT_RGB))?;
+        pane.SetBrush(&tint_brush)?;
+
+        let drawing_surface = graphics_device.CreateDrawingSurface(
+            Size {
+                Width: 1.0,
+                Height: 1.0,
+            },
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            DirectXAlphaMode::Premultiplied,
+        )?;
+        let surface_brush = compositor.CreateSurfaceBrushWithSurface(&drawing_surface)?;
+        content.SetBrush(&surface_brush)?;
+
+        // Rounded clip applied to both the blur and the pane (host backdrop can ignore
+        // a parent clip, so clip each sprite directly).
+        let rounded_geo = compositor.CreateRoundedRectangleGeometry()?;
+        backdrop.SetClip(&compositor.CreateGeometricClipWithGeometry(&rounded_geo)?)?;
+        pane.SetClip(&compositor.CreateGeometricClipWithGeometry(&rounded_geo)?)?;
+
+        // Rounded composition drop shadow, derived from the pane's tinted silhouette.
+        let drop_shadow = compositor.CreateDropShadow()?;
+        drop_shadow.SetColor(color(0xff, (0, 0, 0)))?;
+        drop_shadow.SetOpacity(SHADOW_OPACITY)?;
+        pane.SetShadow(&drop_shadow)?;
+
+        pane.Children()?.InsertAtTop(&content)?;
+        let root_children = root.Children()?;
+        root_children.InsertAtBottom(&backdrop)?;
+        root_children.InsertAtTop(&pane)?;
+        root.SetIsVisible(false)?;
+        target.SetRoot(&root)?;
+
+        // Are composition effects available (transparency on, not battery saver, ...)?
+        // Diagnostic: force on to test the host-backdrop blur directly.
+        let _ = query_effects_supported(hwnd);
+        let effects_supported = true;
 
         Ok(Self {
-            token,
             hwnd,
             hdc_screen,
-            rounded_corner,
+            token,
             show: false,
+            effects_supported,
+            last_size: (0, 0),
+            _compositor: compositor,
+            _target: target,
+            _graphics_device: graphics_device,
+            drawing_surface,
+            root,
+            backdrop,
+            pane,
+            content,
+            rounded_geo,
+            drop_shadow,
+            tint_brush,
+            _d3d_device: d3d_device,
+            _d2d_device: d2d_device,
+            _dispatcher_controller: dispatcher_controller,
         })
     }
 
@@ -92,127 +250,268 @@ impl GdiAAPainter {
             icon_border,
         );
 
-        let corner_radius = if self.rounded_corner {
-            item_size / 4
-        } else {
-            0
-        };
+        // Shadow margin: room around the pane for the blurred shadow.
+        let blur = (SHADOW_BLUR_BASE * dpi_scale as f32).round();
+        let margin = (blur + 12.0 * dpi_scale as f32).round() as i32;
 
-        let hwnd = self.hwnd;
-        let hdc_screen = self.hdc_screen;
+        // Position + size the window (was UpdateLayeredWindow's job).
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                x - margin,
+                y - margin,
+                width + 2 * margin,
+                height + 2 * margin,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
 
-        let (fg_color, bg_color) = theme_color(is_light_theme());
+        if let Err(err) = self.layout(width, height, margin, dpi_scale) {
+            error!("composition layout failed: {err}");
+        }
+        if let Err(err) = self.rasterize_and_upload(state, width, height, icon_size, item_size,
+            border_size, icon_border, dpi_scale)
+        {
+            error!("strip upload failed: {err}");
+        }
+
+        if !self.show {
+            let _ = self.root.SetIsVisible(true);
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            self.show = true;
+        }
+    }
+
+    /// Resizes the visual tree to the current pane size (only when it changed).
+    fn layout(&mut self, width: i32, height: i32, margin: i32, dpi_scale: f64) -> Result<()> {
+        if self.last_size == (width, height) {
+            return Ok(());
+        }
+        let w = width as f32;
+        let h = height as f32;
+        let m = margin as f32;
+
+        self.root.SetSize(Vector2 {
+            X: w + 2.0 * m,
+            Y: h + 2.0 * m,
+        })?;
+        let pane_size = Vector2 { X: w, Y: h };
+        let pane_offset = Vector3 { X: m, Y: m, Z: 0.0 };
+        self.backdrop.SetSize(pane_size)?;
+        self.backdrop.SetOffset(pane_offset)?;
+        self.pane.SetSize(pane_size)?;
+        self.pane.SetOffset(pane_offset)?;
+        self.content.SetSize(pane_size)?;
+
+        self.rounded_geo.SetSize(pane_size)?;
+        let r = CORNER_RADIUS_BASE * dpi_scale as f32;
+        self.rounded_geo.SetCornerRadius(Vector2 { X: r, Y: r })?;
+
+        self.drop_shadow
+            .SetBlurRadius(SHADOW_BLUR_BASE * dpi_scale as f32)?;
+        self.drop_shadow.SetOffset(Vector3 {
+            X: 0.0,
+            Y: SHADOW_OFFSET_Y_BASE * dpi_scale as f32,
+            Z: 0.0,
+        })?;
+
+        // Host-backdrop blur renders opaque black on Win32 desktop windows, so the blur
+        // layer stays hidden; the pane is a translucent frosted tint over the desktop.
+        let _ = self.effects_supported;
+        self.backdrop.SetIsVisible(false)?;
+        self.tint_brush.SetColor(color(TINT_ALPHA, TINT_RGB))?;
+
+        let si: ICompositionDrawingSurfaceInterop = self.drawing_surface.cast()?;
+        unsafe { si.Resize(SIZE { cx: width, cy: height })? };
+        self.last_size = (width, height);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_and_upload(
+        &self,
+        state: &SwitchAppsState,
+        width: i32,
+        height: i32,
+        icon_size: i32,
+        item_size: i32,
+        border_size: i32,
+        icon_border: i32,
+        dpi_scale: f64,
+    ) -> Result<()> {
+        let fg_color = SELECTION_RGB;
 
         unsafe {
-            let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
-            let bitmap_mem = CreateCompatibleBitmap(hdc_screen, width, height);
-            SelectObject(hdc_mem, bitmap_mem.into());
-
-            let mut graphics = GpGraphics::default();
-            let mut graphics_ptr: *mut GpGraphics = &mut graphics;
-            GdipCreateFromHDC(hdc_mem, &mut graphics_ptr as _);
-            GdipSetSmoothingMode(graphics_ptr, SmoothingModeAntiAlias);
-            GdipSetInterpolationMode(graphics_ptr, InterpolationModeHighQualityBicubic);
-
-            let mut bg_pen = GpPen::default();
-            let mut bg_pen_ptr: *mut GpPen = &mut bg_pen;
-            GdipCreatePen1(ALPHA_MASK | bg_color, 0.0, Unit(0), &mut bg_pen_ptr as _);
-
-            let mut bg_brush = GpBrush::default();
-            let mut bg_brush_ptr: *mut GpBrush = &mut bg_brush;
-            GdipGetPenBrushFill(bg_pen_ptr, &mut bg_brush_ptr as _);
-
-            if self.rounded_corner {
-                draw_round_rect(
-                    graphics_ptr,
-                    bg_brush_ptr,
-                    0.0,
-                    0.0,
-                    width as f32,
-                    height as f32,
-                    corner_radius as f32,
-                );
-            } else {
-                GdipFillRectangle(
-                    graphics_ptr,
-                    bg_brush_ptr,
-                    0.0,
-                    0.0,
-                    width as f32,
-                    height as f32,
-                );
-            }
-
-            let icons_width = item_size * state.apps.len() as i32;
-            let icons_height = item_size;
-            let bitmap_icons = draw_icons(
-                state,
-                hdc_screen,
-                icon_size,
-                icon_border,
-                icons_width,
-                icons_height,
-                corner_radius,
-                fg_color,
-                bg_color,
-            );
-
-            let mut bitmap = GpBitmap::default();
-            let mut bitmap_ptr: *mut GpBitmap = &mut bitmap as _;
-            GdipCreateBitmapFromHBITMAP(bitmap_icons, HPALETTE::default(), &mut bitmap_ptr as _);
-
-            let image_ptr: *mut GpImage = bitmap_ptr as *mut GpImage;
-            GdipDrawImageRect(
-                graphics_ptr,
-                image_ptr,
-                border_size as f32,
-                border_size as f32,
-                icons_width as f32,
-                icons_height as f32,
-            );
-
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as _,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as _,
+            // 1) Rasterize the icon row + selection + border into a premultiplied DIB.
+            let hdc_mem = CreateCompatibleDC(Some(self.hdc_screen));
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height, // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
-            let _ = UpdateLayeredWindow(
-                hwnd,
-                Some(hdc_screen),
-                Some(&POINT { x, y }),
-                Some(&SIZE {
-                    cx: width,
-                    cy: height,
-                }),
-                Some(hdc_mem),
-                Some(&POINT::default()),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
+            let mut bits: *mut c_void = std::ptr::null_mut();
+            let bitmap_mem =
+                match CreateDIBSection(Some(self.hdc_screen), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = DeleteDC(hdc_mem);
+                        return Err(anyhow!("CreateDIBSection failed"));
+                    }
+                };
+            let old_bitmap = SelectObject(hdc_mem, bitmap_mem.into());
+
+            let mut bitmap_ptr: *mut GpBitmap = std::ptr::null_mut();
+            GdipCreateBitmapFromScan0(
+                width,
+                height,
+                width * 4,
+                PIXEL_FORMAT_32BPP_PARGB,
+                Some(bits as *const u8),
+                &mut bitmap_ptr,
+            );
+            let image_ptr: *mut GpImage = bitmap_ptr as *mut GpImage;
+            let mut g: *mut GpGraphics = std::ptr::null_mut();
+            GdipGetImageGraphicsContext(image_ptr, &mut g);
+            GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+            GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
+            GdipSetPixelOffsetMode(g, PixelOffsetModeHighQuality);
+
+            // Transparent background: the tint + blur come from composition layers.
+            GdipGraphicsClear(g, 0x00000000);
+
+            // Rounded 1px stroke that follows the pane's rounded corners (a rectangular
+            // border would be clipped at the corners by the composition rounded clip).
+            let stroke = (dpi_scale.round() as f32).max(1.0);
+            let w = width as f32;
+            let h = height as f32;
+            let inset = stroke; // inner rim: keep the whole stroke inside the rounded clip
+            let corner = CORNER_RADIUS_BASE * dpi_scale as f32;
+            stroke_round_rect(
+                g,
+                BORDER_COLOR,
+                inset,
+                inset,
+                w - 2.0 * inset,
+                h - 2.0 * inset,
+                (corner - inset).max(0.0),
+                stroke,
             );
 
-            GdipDisposeImage(image_ptr);
-            GdipDeleteBrush(bg_brush_ptr);
-            GdipDeletePen(bg_pen_ptr);
-            GdipDeleteGraphics(graphics_ptr);
+            // Rounded selection highlight behind the selected app.
+            let sel_left = (border_size + item_size * state.index as i32) as f32;
+            let sel_top = border_size as f32;
+            let sel_radius = (item_size as f32 / 4.0).min(8.0 * dpi_scale as f32);
+            fill_round_rect(
+                g,
+                (SELECTION_ALPHA << 24) | fg_color,
+                sel_left,
+                sel_top,
+                item_size as f32,
+                item_size as f32,
+                sel_radius,
+            );
 
-            let _ = DeleteObject(bitmap_icons.into());
+            // Icons. Build a correct premultiplied bitmap ourselves (GdipCreateBitmapFromHICON
+            // ignores the AND-mask for non-alpha icons and fills them with opaque black).
+            for (i, (icon, _)) in state.apps.iter().enumerate() {
+                let Some((iw, ih, buf)) = hicon_to_pbgra(self.hdc_screen, *icon) else {
+                    continue;
+                };
+                let mut icon_ptr: *mut GpBitmap = std::ptr::null_mut();
+                if GdipCreateBitmapFromScan0(
+                    iw,
+                    ih,
+                    iw * 4,
+                    PIXEL_FORMAT_32BPP_PARGB,
+                    Some(buf.as_ptr()),
+                    &mut icon_ptr,
+                )
+                .0 != 0
+                    || icon_ptr.is_null()
+                {
+                    continue;
+                }
+                let ix = border_size + item_size * (i as i32) + icon_border;
+                let iy = border_size + icon_border;
+                GdipDrawImageRectI(g, icon_ptr as *mut GpImage, ix, iy, icon_size, icon_size);
+                GdipDisposeImage(icon_ptr as *mut GpImage);
+                // `buf` must outlive the draw above (GdipCreateBitmapFromScan0 does not copy).
+                drop(buf);
+            }
+            GdipDeleteGraphics(g);
+            GdipDisposeImage(image_ptr);
+
+            // 2) Upload the DIB into the composition drawing surface via D2D.
+            let upload = self.upload_surface(bits, width, height);
+
+            SelectObject(hdc_mem, old_bitmap);
             let _ = DeleteObject(bitmap_mem.into());
             let _ = DeleteDC(hdc_mem);
+            upload
         }
+    }
 
-        if self.show {
-            return;
-        }
+    unsafe fn upload_surface(&self, bits: *mut c_void, width: i32, height: i32) -> Result<()> {
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetFocus(Some(self.hwnd));
+            let si: ICompositionDrawingSurfaceInterop = self.drawing_surface.cast()?;
+            let mut offset = POINT::default();
+            let dc: ID2D1DeviceContext = si.BeginDraw(None, &mut offset)?;
+
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                colorContext: ManuallyDrop::new(None),
+            };
+            let bitmap = dc.CreateBitmap(
+                D2D_SIZE_U {
+                    width: width as u32,
+                    height: height as u32,
+                },
+                Some(bits as *const c_void),
+                (width * 4) as u32,
+                &props,
+            )?;
+
+            // COPY blend so transparent source pixels overwrite stale surface content.
+            dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            let dest = D2D_RECT_F {
+                left: offset.x as f32,
+                top: offset.y as f32,
+                right: (offset.x + width) as f32,
+                bottom: (offset.y + height) as f32,
+            };
+            dc.DrawBitmap(
+                &bitmap,
+                Some(&dest),
+                1.0,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                None,
+                None,
+            );
+            si.EndDraw()?;
         }
-        self.show = true;
+        Ok(())
     }
 
     pub fn unpaint(&mut self, _state: SwitchAppsState) {
+        let _ = self.root.SetIsVisible(false);
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -257,169 +556,201 @@ impl GdiAAPainter {
 impl Drop for GdiAAPainter {
     fn drop(&mut self) {
         unsafe {
-            ReleaseDC(Some(self.hwnd), self.hdc_screen);
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            ReleaseDC(None, self.hdc_screen);
             GdiplusShutdown(self.token);
         }
+        // Composition COM objects + dispatcher controller drop via field order.
     }
 }
 
-const fn theme_color(light_theme: bool) -> (u32, u32) {
-    match light_theme {
-        true => (FG_LIGHT_COLOR, BG_LIGHT_COLOR),
-        false => (FG_DARK_COLOR, BG_DARK_COLOR),
-    }
+fn color(a: u8, (r, g, b): (u8, u8, u8)) -> Color {
+    Color { A: a, R: r, G: g, B: b }
 }
 
-unsafe fn draw_round_rect(
-    graphic_ptr: *mut GpGraphics,
-    brush_ptr: *mut GpBrush,
+/// Creates a hardware D3D11 device (with BGRA support for D2D), falling back to WARP.
+fn create_d3d_device() -> Result<ID3D11Device> {
+    for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+        let mut device: Option<ID3D11Device> = None;
+        let hr = unsafe {
+            D3D11CreateDevice(
+                None,
+                driver,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+        };
+        if hr.is_ok() {
+            if let Some(device) = device {
+                return Ok(device);
+            }
+        }
+    }
+    Err(anyhow!("D3D11CreateDevice failed for hardware and WARP"))
+}
+
+fn query_effects_supported(hwnd: HWND) -> Result<bool> {
+    let factory: ICompositionCapabilitiesInteropFactory =
+        windows::core::factory::<CompositionCapabilities, ICompositionCapabilitiesInteropFactory>()?;
+    let caps = unsafe { factory.GetForWindow(hwnd)? };
+    Ok(caps.AreEffectsSupported()?)
+}
+
+/// Strokes an antialiased rounded-rectangle outline with a solid ARGB color (GDI+).
+unsafe fn stroke_round_rect(
+    g: *mut GpGraphics,
+    color_argb: u32,
     left: f32,
     top: f32,
-    right: f32,
-    bottom: f32,
-    corner_radius: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    pen_width: f32,
 ) {
     unsafe {
-        let mut path = GpPath::default();
-        let mut path_ptr: *mut GpPath = &mut path;
-        GdipCreatePath(FillModeAlternate, &mut path_ptr as _);
-        GdipAddPathArc(
-            path_ptr,
-            left,
-            top,
-            corner_radius,
-            corner_radius,
-            180.0,
-            90.0,
-        );
-        GdipAddPathArc(
-            path_ptr,
-            right - corner_radius,
-            top,
-            corner_radius,
-            corner_radius,
-            270.0,
-            90.0,
-        );
-        GdipAddPathArc(
-            path_ptr,
-            right - corner_radius,
-            bottom - corner_radius,
-            corner_radius,
-            corner_radius,
-            0.0,
-            90.0,
-        );
-        GdipAddPathArc(
-            path_ptr,
-            left,
-            bottom - corner_radius,
-            corner_radius,
-            corner_radius,
-            90.0,
-            90.0,
-        );
-        GdipClosePathFigure(path_ptr);
-        GdipFillPath(graphic_ptr, brush_ptr, path_ptr);
-        GdipDeletePath(path_ptr);
+        let d = radius * 2.0;
+        let right = left + w;
+        let bottom = top + h;
+        let mut pen: *mut GpPen = std::ptr::null_mut();
+        GdipCreatePen1(color_argb, pen_width, Unit(2), &mut pen); // Unit(2) = pixels
+        let mut path: *mut GpPath = std::ptr::null_mut();
+        GdipCreatePath(FillModeAlternate, &mut path);
+        GdipAddPathArc(path, left, top, d, d, 180.0, 90.0);
+        GdipAddPathArc(path, right - d, top, d, d, 270.0, 90.0);
+        GdipAddPathArc(path, right - d, bottom - d, d, d, 0.0, 90.0);
+        GdipAddPathArc(path, left, bottom - d, d, d, 90.0, 90.0);
+        GdipClosePathFigure(path);
+        GdipDrawPath(g, pen, path);
+        GdipDeletePath(path);
+        GdipDeletePen(pen);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_icons(
-    state: &SwitchAppsState,
-    hdc_screen: HDC,
-    icon_size: i32,
-    icon_border: i32,
-    width: i32,
-    height: i32,
-    corner_radius: i32,
-    fg_color: u32,
-    bg_color: u32,
-) -> HBITMAP {
-    let scaled_width = width * SCALE_FACTOR;
-    let scaled_height = height * SCALE_FACTOR;
-    let scaled_corner_radius = corner_radius * SCALE_FACTOR;
-    let scaled_border_size = icon_border * SCALE_FACTOR;
-    let scaled_icon_inner_size = icon_size * SCALE_FACTOR;
-    let scaled_icon_outer_size = scaled_icon_inner_size + scaled_border_size * 2;
-
+/// Fills an antialiased rounded rectangle with a solid ARGB color (GDI+).
+unsafe fn fill_round_rect(
+    g: *mut GpGraphics,
+    color_argb: u32,
+    left: f32,
+    top: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+) {
     unsafe {
-        let hdc_tmp = CreateCompatibleDC(Some(hdc_screen));
-        let bitmap_tmp = CreateCompatibleBitmap(hdc_screen, width, height);
-        SelectObject(hdc_tmp, bitmap_tmp.into());
+        let d = radius * 2.0;
+        let right = left + w;
+        let bottom = top + h;
+        let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+        GdipCreateSolidFill(color_argb, &mut brush);
+        let mut path: *mut GpPath = std::ptr::null_mut();
+        GdipCreatePath(FillModeAlternate, &mut path);
+        GdipAddPathArc(path, left, top, d, d, 180.0, 90.0);
+        GdipAddPathArc(path, right - d, top, d, d, 270.0, 90.0);
+        GdipAddPathArc(path, right - d, bottom - d, d, d, 0.0, 90.0);
+        GdipAddPathArc(path, left, bottom - d, d, d, 90.0, 90.0);
+        GdipClosePathFigure(path);
+        GdipFillPath(g, brush as *mut GpBrush, path);
+        GdipDeletePath(path);
+        GdipDeleteBrush(brush as *mut GpBrush);
+    }
+}
 
-        let hdc_scaled = CreateCompatibleDC(Some(hdc_screen));
-        let bitmap_scaled = CreateCompatibleBitmap(hdc_screen, scaled_width, scaled_height);
-        SelectObject(hdc_scaled, bitmap_scaled.into());
+/// Extracts an HICON into a premultiplied BGRA buffer (`width, height, pixels`), using
+/// the icon's alpha channel when present and otherwise deriving alpha from its AND-mask.
+/// This is the correct path that `GdipCreateBitmapFromHICON` gets wrong for mask icons.
+unsafe fn hicon_to_pbgra(hdc: HDC, hicon: HICON) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let mut info = ICONINFO::default();
+        if GetIconInfo(hicon, &mut info).is_err() {
+            return None;
+        }
+        let color = info.hbmColor;
+        let mask = info.hbmMask;
 
-        let fg_brush = CreateSolidBrush(COLORREF(fg_color));
-        let bg_brush = CreateSolidBrush(COLORREF(bg_color));
-
-        let rect = RECT {
-            left: 0,
-            top: 0,
-            right: scaled_width,
-            bottom: scaled_height,
+        let cleanup = || {
+            let _ = DeleteObject(color.into());
+            let _ = DeleteObject(mask.into());
         };
 
-        FillRect(hdc_scaled, &rect, bg_brush);
-
-        for (i, (icon, _)) in state.apps.iter().enumerate() {
-            // draw the box for selected icon
-            if i == state.index {
-                let left = scaled_icon_outer_size * (i as i32);
-                let top = 0;
-                let right = left + scaled_icon_outer_size;
-                let bottom = top + scaled_icon_outer_size;
-                let rgn = CreateRoundRectRgn(
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    scaled_corner_radius,
-                    scaled_corner_radius,
-                );
-                let _ = FillRgn(hdc_scaled, rgn, fg_brush);
-                let _ = DeleteObject(rgn.into());
-            }
-
-            let cx = scaled_border_size + scaled_icon_outer_size * (i as i32);
-            let _ = DrawIconEx(
-                hdc_scaled,
-                cx,
-                scaled_border_size,
-                *icon,
-                scaled_icon_inner_size,
-                scaled_icon_inner_size,
-                0,
-                None,
-                DI_NORMAL,
-            );
+        let mut bmp = BITMAP::default();
+        if GetObjectW(
+            color.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut _ as *mut c_void),
+        ) == 0
+        {
+            cleanup();
+            return None;
+        }
+        let (w, h) = (bmp.bmWidth, bmp.bmHeight);
+        if w <= 0 || h <= 0 {
+            cleanup();
+            return None;
         }
 
-        SetStretchBltMode(hdc_tmp, HALFTONE);
-        let _ = StretchBlt(
-            hdc_tmp,
-            0,
-            0,
-            width,
-            height,
-            Some(hdc_scaled),
-            0,
-            0,
-            scaled_width,
-            scaled_height,
-            SRCCOPY,
-        );
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let _ = DeleteObject(fg_brush.into());
-        let _ = DeleteObject(bg_brush.into());
-        let _ = DeleteObject(bitmap_scaled.into());
-        let _ = DeleteDC(hdc_scaled);
-        let _ = DeleteDC(hdc_tmp);
+        let count = (w * h) as usize;
+        let mut buf = vec![0u8; count * 4];
+        if GetDIBits(
+            hdc,
+            color,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        ) == 0
+        {
+            cleanup();
+            return None;
+        }
 
-        bitmap_tmp
+        // No alpha channel? Derive it from the AND-mask (mask black = opaque).
+        if !buf.chunks_exact(4).any(|p| p[3] != 0) {
+            let mut mask_buf = vec![0u8; count * 4];
+            if GetDIBits(
+                hdc,
+                mask,
+                0,
+                h as u32,
+                Some(mask_buf.as_mut_ptr() as *mut c_void),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            ) != 0
+            {
+                for (p, m) in buf.chunks_exact_mut(4).zip(mask_buf.chunks_exact(4)) {
+                    p[3] = if m[0] == 0 { 255 } else { 0 };
+                }
+            }
+        }
+
+        // Premultiply for the PARGB target surface.
+        for p in buf.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            p[0] = (p[0] as u32 * a / 255) as u8;
+            p[1] = (p[1] as u32 * a / 255) as u8;
+            p[2] = (p[2] as u32 * a / 255) as u8;
+        }
+
+        cleanup();
+        Some((w, h, buf))
     }
 }
 

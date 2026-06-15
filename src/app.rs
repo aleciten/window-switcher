@@ -17,12 +17,11 @@ use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-        CW_USEDEFAULT, GWL_STYLE, HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND,
-        WM_ERASEBKGND, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW, LoadCursorW,
+        PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, TranslateMessage,
+        CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HICON, HTCLIENT, IDC_ARROW, MSG, WM_COMMAND,
+        WM_ERASEBKGND, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
+        WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     },
 };
 
@@ -142,10 +141,15 @@ impl App {
 
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                // A composition-hosted window: no GDI redirection surface (the compositor
+                // draws every pixel), topmost, off the taskbar, and never activates.
+                WS_EX_NOREDIRECTIONBITMAP
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
                 PCWSTR(atom as _),
                 NAME,
-                WINDOW_STYLE(0),
+                WS_POPUP,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -157,11 +161,6 @@ impl App {
             )
         }
         .map_err(|err| anyhow!("Failed to create windows, {err}"))?;
-
-        // hide caption
-        let mut style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
-        style &= !WS_CAPTION.0;
-        unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, style as _) };
 
         Ok(hwnd)
     }

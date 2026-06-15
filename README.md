@@ -6,7 +6,7 @@ Window-Switcher offers hotkeys for quickly switching windows on Windows OS:
 
 ![switch-windows](https://github.com/sigoden/window-switcher/assets/4012553/06d387ce-31fd-450b-adf3-01bfcfc4bce3)
 
-2. ```Alt+Tab```: switch between apps. (disabled by default)
+2. ```Alt+Tab```: switch between apps. (enabled by default)
 
 ![switch-apps](https://github.com/sigoden/window-switcher/assets/4012553/0c74a7ca-3a48-4458-8d2d-b40dc041f067)
 
@@ -53,7 +53,7 @@ only_current_desktop = auto
 [switch-apps]
 
 # Whether to enable switching apps
-enable = no 
+enable = yes
 
 # Hotkey to switch apps
 hotkey = alt+tab
@@ -63,7 +63,34 @@ ignore_minimal = no
 
 # Only switch apps within the current virtual desktops: yes/no/auto
 only_current_desktop = auto
+
+# Overlay colors, as hex AARRGGBB (alpha-red-green-blue) or RRGGBB (opaque).
+# Leave unset to use the defaults shown below.
+#
+# Frosted background tint of the pane:
+background_color = e0f3f3f3
+# Bevel border, lit edge (top + left):
+border_light_color = 5cffffff
+# Bevel border, shadowed edge (bottom + right):
+border_dark_color = 26000000
+# Highlight behind the selected app (the cursor):
+selection_color = 590067c0
 ```
+
+### Customizing the switch-apps overlay
+
+The switch-apps overlay is rendered with a frosted "glass" look — a translucent
+pane with rounded corners, a soft drop shadow, and a beveled border. Its colors
+are fully customizable through the `[switch-apps]` section above:
+
+- `background_color` — the frosted background tint of the pane.
+- `border_light_color` — the lit bevel edge (top + left).
+- `border_dark_color` — the shadowed bevel edge (bottom + right).
+- `selection_color` — the highlight drawn behind the currently selected app.
+
+Each value is a hex color, either `RRGGBB` (opaque) or `AARRGGBB` with an alpha
+channel, with an optional leading `#`. Any color you leave unset falls back to
+the default shown above.
 
 ## Running as Administrator (Optional)
 

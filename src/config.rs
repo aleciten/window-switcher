@@ -10,6 +10,7 @@ use crate::utils::{get_exe_folder, RegKey};
 
 pub const SWITCH_WINDOWS_HOTKEY_ID: u32 = 1;
 pub const SWITCH_APPS_HOTKEY_ID: u32 = 2;
+pub const SWITCH_APP_WINDOWS_HOTKEY_ID: u32 = 3;
 
 const DEFAULT_CONFIG: &str = include_str!("../window-switcher.ini");
 
@@ -58,6 +59,8 @@ pub struct Config {
     pub switch_apps_override_icons: IndexMap<String, String>,
     switch_apps_only_current_desktop: Option<bool>,
     pub switch_apps_colors: SwitchAppsColors,
+    pub switch_app_windows_enable: bool,
+    pub switch_app_windows_hotkey: Vec<Hotkey>,
 }
 
 impl Default for Config {
@@ -86,6 +89,13 @@ impl Default for Config {
             switch_apps_override_icons: Default::default(),
             switch_apps_only_current_desktop: None,
             switch_apps_colors: SwitchAppsColors::default(),
+            switch_app_windows_enable: true,
+            switch_app_windows_hotkey: vec![Hotkey::create(
+                SWITCH_APP_WINDOWS_HOTKEY_ID,
+                "switch app windows",
+                "alt + ctrl + tab",
+            )
+            .unwrap()],
         }
     }
 }
@@ -184,11 +194,28 @@ impl Config {
                 conf.switch_apps_colors.selection = v;
             }
         }
+        if let Some(section) = ini_conf.section(Some("switch-app-windows")) {
+            if let Some(v) = section.get("enable").and_then(Config::to_bool) {
+                conf.switch_app_windows_enable = v;
+            }
+            if let Some(v) = section.get("hotkey") {
+                if !v.trim().is_empty() {
+                    conf.switch_app_windows_hotkey =
+                        parse_hotkeys(SWITCH_APP_WINDOWS_HOTKEY_ID, "switch app windows", v)?;
+                }
+            }
+        }
         Ok(conf)
     }
 
     pub fn to_hotkeys(&self) -> Vec<&Hotkey> {
         let mut hotkeys: Vec<&Hotkey> = self.switch_windows_hotkey.iter().collect();
+        // Register the two-modifier app-windows hotkey BEFORE switch-apps: the keyboard
+        // hook matches first-and-break, so `alt+ctrl+tab` resolves to app-windows rather
+        // than the `alt+tab` switch-apps hotkey (alt is held in both).
+        if self.switch_app_windows_enable {
+            hotkeys.extend(self.switch_app_windows_hotkey.iter());
+        }
         if self.switch_apps_enable {
             hotkeys.extend(self.switch_apps_hotkey.iter());
         }
@@ -236,17 +263,20 @@ pub struct Hotkey {
     pub id: u32,
     pub name: String,
     pub modifier: [u32; 2],
+    /// Optional second modifier that must also be held (e.g. ctrl in `alt + ctrl + tab`).
+    pub modifier2: Option<[u32; 2]>,
     pub code: u32,
 }
 
 impl Hotkey {
     pub fn create(id: u32, name: &str, value: &str) -> Result<Self> {
-        let (modifier, code) =
+        let (modifier, modifier2, code) =
             Self::parse(value).ok_or_else(|| anyhow!("Invalid {name} hotkey"))?;
         Ok(Self {
             id,
             name: name.to_string(),
             modifier,
+            modifier2,
             code,
         })
     }
@@ -255,25 +285,41 @@ impl Hotkey {
         self.modifier[0]
     }
 
-    pub fn parse(value: &str) -> Option<([u32; 2], u32)> {
+    pub fn parse(value: &str) -> Option<([u32; 2], Option<[u32; 2]>, u32)> {
         let value = value
             .to_ascii_lowercase()
             .replace(' ', "")
             .replace("vk_", "");
         let keys: Vec<&str> = value.split('+').collect();
-        if keys.len() != 2 {
-            return None;
-        }
-        let modifier = match keys[0] {
-            "win" => [0x5b, 0x5c],
-            "alt" => [0x38, 0x38],
-            "ctrl" => [0x1d, 0x1d],
-            _ => {
-                return None;
+        let (modifier, modifier2, key) = match keys.as_slice() {
+            [m, k] => (parse_modifier(m)?, None, *k),
+            [m, m2, k] => {
+                let modifier = parse_modifier(m)?;
+                let modifier2 = parse_modifier(m2)?;
+                if modifier == modifier2 {
+                    return None;
+                }
+                (modifier, Some(modifier2), *k)
             }
+            _ => return None,
         };
-        // see <https://kbdlayout.info/kbdus/overview+scancodes>
-        let code = match keys[1] {
+        let code = parse_key(key)?;
+        Some((modifier, modifier2, code))
+    }
+}
+
+fn parse_modifier(key: &str) -> Option<[u32; 2]> {
+    match key {
+        "win" => Some([0x5b, 0x5c]),
+        "alt" => Some([0x38, 0x38]),
+        "ctrl" => Some([0x1d, 0x1d]),
+        _ => None,
+    }
+}
+
+fn parse_key(key: &str) -> Option<u32> {
+    // see <https://kbdlayout.info/kbdus/overview+scancodes>
+    let code = match key {
             "esc" | "escape" => 0x01,
             "1" | "!" => 0x02,
             "2" | "@" => 0x03,
@@ -356,9 +402,8 @@ impl Hotkey {
             "menu" => 0x5d,
             _ => return None,
         };
-        Some((modifier, code))
+        Some(code)
     }
-}
 
 pub fn load_config() -> Result<Config> {
     let filepath = get_config_path()?;
@@ -441,8 +486,16 @@ mod tests {
 
     #[test]
     fn test_hotkey() {
-        assert_eq!(Hotkey::parse("alt + `"), Some(([0x38, 0x38], 0x29)));
-        assert_eq!(Hotkey::parse("alt + tab"), Some(([0x38, 0x38], 0x0f)));
+        assert_eq!(Hotkey::parse("alt + `"), Some(([0x38, 0x38], None, 0x29)));
+        assert_eq!(Hotkey::parse("alt + tab"), Some(([0x38, 0x38], None, 0x0f)));
+        assert_eq!(
+            Hotkey::parse("alt + ctrl + tab"),
+            Some(([0x38, 0x38], Some([0x1d, 0x1d]), 0x0f))
+        );
+        // Two identical modifiers are rejected.
+        assert_eq!(Hotkey::parse("alt + alt + tab"), None);
+        // More than two modifiers is rejected.
+        assert_eq!(Hotkey::parse("alt + ctrl + win + tab"), None);
     }
 
     #[test]
@@ -458,6 +511,12 @@ mod tests {
         assert_eq!(hotkeys.len(), 1);
         assert_eq!(hotkeys[0].modifier, [0x38, 0x38]);
         assert_eq!(hotkeys[0].code, 0x29);
+
+        let hotkeys = parse_hotkeys(3, "test", "alt + ctrl + tab").unwrap();
+        assert_eq!(hotkeys.len(), 1);
+        assert_eq!(hotkeys[0].modifier, [0x38, 0x38]);
+        assert_eq!(hotkeys[0].modifier2, Some([0x1d, 0x1d]));
+        assert_eq!(hotkeys[0].code, 0x0f);
     }
 
     #[test]

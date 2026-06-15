@@ -1,11 +1,11 @@
-use crate::app::SwitchAppsState;
+use crate::app::{SwitchAppWindowsState, SwitchAppsState};
 use crate::config::SwitchAppsColors;
 use crate::utils::{check_error, get_moinitor_rect};
 
 use anyhow::{anyhow, Context, Result};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use windows::core::Interface;
+use windows::core::{w, Interface, PCWSTR};
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::System::DispatcherQueueController;
@@ -37,14 +37,21 @@ use windows::Win32::{
             DIB_RGB_COLORS, HDC,
         },
         GdiPlus::{
-            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateBitmapFromScan0,
-            GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush,
-            GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawImageRectI,
-            GdipDrawPath, GdipFillPath, GdipGetImageGraphicsContext, GdipGraphicsClear,
+            FillModeAlternate, FontStyleRegular, GdipAddPathArc, GdipClosePathFigure,
+            GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName,
+            GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipCreateStringFormat,
+            GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily, GdipDeleteGraphics,
+            GdipDeletePath, GdipDeletePen, GdipDeleteStringFormat, GdipDisposeImage,
+            GdipDrawImageRectI, GdipDrawPath, GdipDrawString, GdipFillPath,
+            GdipGetImageGraphicsContext, GdipGraphicsClear, GdipMeasureString,
             GdipSetInterpolationMode, GdipSetPixelOffsetMode, GdipSetSmoothingMode,
-            GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpGraphics,
-            GpImage, GpPath, GpPen, GpSolidFill, InterpolationModeHighQualityBicubic,
-            PixelOffsetModeHighQuality, SmoothingModeAntiAlias, Unit,
+            GdipSetStringFormatAlign, GdipSetStringFormatFlags, GdipSetStringFormatLineAlign,
+            GdipSetStringFormatTrimming, GdipSetTextRenderingHint, GdiplusShutdown, GdiplusStartup,
+            GdiplusStartupInput, GpBitmap, GpBrush, GpFont, GpFontFamily, GpGraphics, GpImage,
+            GpPath, GpPen, GpSolidFill, GpStringFormat, InterpolationModeHighQualityBicubic,
+            PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias, StringAlignmentCenter,
+            StringAlignmentNear, StringFormatFlagsNoWrap, StringTrimmingEllipsisCharacter,
+            TextRenderingHintAntiAlias, Unit, UnitPixel,
         },
     },
     System::WinRT::{
@@ -72,6 +79,21 @@ pub const WINDOW_BORDER_SIZE_BASE: i32 = 16;
 /// Padding around each icon, i.e. the margin between apps in the list.
 pub const ICON_BORDER_SIZE_BASE: i32 = 14;
 
+// Vertical app-windows popup metrics, in px @ 96dpi (scaled by DPI at paint time).
+/// Icon size on each row.
+pub const ROW_ICON_SIZE_BASE: i32 = 24;
+/// Height of each window row.
+pub const ROW_HEIGHT_BASE: i32 = 36;
+/// Horizontal padding around the icon / between icon and text / trailing the text.
+pub const ROW_TEXT_PAD_BASE: i32 = 10;
+/// Font em-size (UnitPixel) for the window titles.
+const FONT_SIZE_BASE: f32 = 14.0;
+/// Min / max popup width clamp, in px @ 96dpi.
+const POPUP_MIN_WIDTH_BASE: i32 = 280;
+const POPUP_MAX_WIDTH_BASE: i32 = 680;
+/// Title text color (opaque dark grey).
+const TITLE_TEXT_COLOR: u32 = 0xff20_2020;
+
 // The pane background tint, bevel border (light/dark), and selection colors are
 // configurable via the .ini; see `SwitchAppsColors` and its defaults in config.rs.
 /// Border thickness in px @ 96dpi (scaled by DPI).
@@ -88,10 +110,12 @@ const SHADOW_OPACITY: f32 = 0.5;
 /// 32bpp premultiplied ARGB, the format the GDI+ strip rasterizer produces.
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000e200b;
 
-/// Windows.UI.Composition renderer for the Alt+Tab overlay: a host-backdrop acrylic
-/// pane with rounded corners and a real composition drop shadow. The icon row is
-/// rasterized with GDI+ and uploaded into a composition drawing surface.
-pub struct GdiAAPainter {
+/// Shared Windows.UI.Composition overlay host: a host-backdrop acrylic pane with rounded
+/// corners and a real composition drop shadow, hosted on the app window. Both the Alt+Tab
+/// (horizontal) and Alt+Ctrl+Tab (vertical) painters draw into this single surface — only
+/// one popup is ever shown at a time — by handing `render` a closure that rasterizes their
+/// content with GDI+ into a premultiplied DIB which is then uploaded to the surface.
+pub struct Overlay {
     hwnd: HWND,
     hdc_screen: HDC,
     token: usize, // GdiplusStartup token
@@ -120,7 +144,7 @@ pub struct GdiAAPainter {
     _dispatcher_controller: DispatcherQueueController,
 }
 
-impl GdiAAPainter {
+impl Overlay {
     pub fn new(hwnd: HWND, colors: SwitchAppsColors) -> Result<Self> {
         // A DispatcherQueue on this (message-loop) thread is required before the
         // Compositor; DQTAT_COM_STA initializes the apartment as STA.
@@ -231,26 +255,22 @@ impl GdiAAPainter {
         })
     }
 
-    pub fn paint(&mut self, state: &SwitchAppsState) {
-        let dpi_scale = get_dpi_scale(self.hwnd);
-        let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
-        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
-        let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
 
-        let Coordinate {
-            x,
-            y,
-            width,
-            height,
-            icon_size,
-            item_size,
-        } = Coordinate::new(
-            state.apps.len() as i32,
-            icon_size_max,
-            border_size,
-            icon_border,
-        );
+    pub fn colors(&self) -> SwitchAppsColors {
+        self.colors
+    }
 
+    /// Positions/sizes the host window for a `width`x`height` pane at `(x, y)`, resizes the
+    /// composition tree, rasterizes the caller's content via `draw` into a premultiplied DIB,
+    /// uploads it, and shows the window. `draw` receives a GDI+ graphics context whose origin
+    /// is the pane's top-left corner; it should paint onto a fully transparent background.
+    pub fn render<F>(&mut self, x: i32, y: i32, width: i32, height: i32, dpi_scale: f64, draw: F)
+    where
+        F: FnOnce(*mut GpGraphics),
+    {
         // Shadow margin: room around the pane for the blurred shadow.
         let blur = (SHADOW_BLUR_BASE * dpi_scale as f32).round();
         let margin = (blur + 12.0 * dpi_scale as f32).round() as i32;
@@ -271,9 +291,7 @@ impl GdiAAPainter {
         if let Err(err) = self.layout(width, height, margin, dpi_scale) {
             error!("composition layout failed: {err}");
         }
-        if let Err(err) = self.rasterize_and_upload(state, width, height, icon_size, item_size,
-            border_size, icon_border, dpi_scale)
-        {
+        if let Err(err) = unsafe { self.rasterize_and_upload(width, height, draw) } {
             error!("strip upload failed: {err}");
         }
 
@@ -285,6 +303,13 @@ impl GdiAAPainter {
             }
             self.show = true;
         }
+    }
+
+    /// Returns the shadow margin (px) for a given DPI — the gap the popup leaves around the
+    /// pane so its drop shadow isn't clipped. Painters need it to size their layout.
+    pub fn shadow_margin(dpi_scale: f64) -> i32 {
+        let blur = (SHADOW_BLUR_BASE * dpi_scale as f32).round();
+        (blur + 12.0 * dpi_scale as f32).round() as i32
     }
 
     /// Resizes the visual tree to the current pane size (only when it changed).
@@ -332,20 +357,13 @@ impl GdiAAPainter {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn rasterize_and_upload(
-        &self,
-        state: &SwitchAppsState,
-        width: i32,
-        height: i32,
-        icon_size: i32,
-        item_size: i32,
-        border_size: i32,
-        icon_border: i32,
-        dpi_scale: f64,
-    ) -> Result<()> {
+    /// Creates a premultiplied top-down 32bpp DIB + GDI+ graphics context of the given size,
+    /// clears it transparent, runs `draw` to render content, then uploads it to the surface.
+    unsafe fn rasterize_and_upload<F>(&self, width: i32, height: i32, draw: F) -> Result<()>
+    where
+        F: FnOnce(*mut GpGraphics),
+    {
         unsafe {
-            // 1) Rasterize the icon row + selection + border into a premultiplied DIB.
             let hdc_mem = CreateCompatibleDC(Some(self.hdc_screen));
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -390,74 +408,12 @@ impl GdiAAPainter {
             // Transparent background: the tint + blur come from composition layers.
             GdipGraphicsClear(g, 0x00000000);
 
-            // Rounded 1px stroke that follows the pane's rounded corners (a rectangular
-            // border would be clipped at the corners by the composition rounded clip).
-            let pen_width = (BORDER_WIDTH_BASE * dpi_scale as f32).max(1.0);
-            let w = width as f32;
-            let h = height as f32;
-            // Centered stroke inset by half its width so its OUTER edge sits flush on the
-            // pane edge (no sliver of tint showing outside the border).
-            let inset = pen_width * 0.5;
-            let corner = CORNER_RADIUS_BASE * dpi_scale as f32;
-            let blur = BORDER_BLUR_BASE * dpi_scale as f32;
-            stroke_round_rect(
-                g,
-                self.colors.border_light,
-                self.colors.border_dark,
-                inset,
-                inset,
-                w - 2.0 * inset,
-                h - 2.0 * inset,
-                (corner - inset).max(0.0),
-                pen_width,
-                blur,
-            );
+            draw(g);
 
-            // Rounded selection highlight behind the selected app.
-            let sel_left = (border_size + item_size * state.index as i32) as f32;
-            let sel_top = border_size as f32;
-            let sel_radius = (item_size as f32 / 4.0).min(8.0 * dpi_scale as f32);
-            fill_round_rect(
-                g,
-                self.colors.selection,
-                sel_left,
-                sel_top,
-                item_size as f32,
-                item_size as f32,
-                sel_radius,
-            );
-
-            // Icons. Build a correct premultiplied bitmap ourselves (GdipCreateBitmapFromHICON
-            // ignores the AND-mask for non-alpha icons and fills them with opaque black).
-            for (i, (icon, _)) in state.apps.iter().enumerate() {
-                let Some((iw, ih, buf)) = hicon_to_pbgra(self.hdc_screen, *icon) else {
-                    continue;
-                };
-                let mut icon_ptr: *mut GpBitmap = std::ptr::null_mut();
-                if GdipCreateBitmapFromScan0(
-                    iw,
-                    ih,
-                    iw * 4,
-                    PIXEL_FORMAT_32BPP_PARGB,
-                    Some(buf.as_ptr()),
-                    &mut icon_ptr,
-                )
-                .0 != 0
-                    || icon_ptr.is_null()
-                {
-                    continue;
-                }
-                let ix = border_size + item_size * (i as i32) + icon_border;
-                let iy = border_size + icon_border;
-                GdipDrawImageRectI(g, icon_ptr as *mut GpImage, ix, iy, icon_size, icon_size);
-                GdipDisposeImage(icon_ptr as *mut GpImage);
-                // `buf` must outlive the draw above (GdipCreateBitmapFromScan0 does not copy).
-                drop(buf);
-            }
             GdipDeleteGraphics(g);
             GdipDisposeImage(image_ptr);
 
-            // 2) Upload the DIB into the composition drawing surface via D2D.
+            // Upload the DIB into the composition drawing surface via D2D.
             let upload = self.upload_surface(bits, width, height);
 
             SelectObject(hdc_mem, old_bitmap);
@@ -514,22 +470,108 @@ impl GdiAAPainter {
         Ok(())
     }
 
-    pub fn unpaint(&mut self, _state: SwitchAppsState) {
+    /// Hides the overlay window (ends a popup).
+    pub fn hide(&mut self) {
         let _ = self.root.SetIsVisible(false);
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.show = false;
     }
+}
 
-    pub fn find_clicked_app_index(&self, state: &SwitchAppsState) -> Option<usize> {
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            ReleaseDC(None, self.hdc_screen);
+            GdiplusShutdown(self.token);
+        }
+        // Composition COM objects + dispatcher controller drop via field order.
+    }
+}
+
+/// The Alt+Tab app switcher: a horizontal row of app icons with a selection highlight.
+pub struct AppsPainter;
+
+impl AppsPainter {
+    pub fn paint(&self, overlay: &mut Overlay, state: &SwitchAppsState) {
+        let dpi_scale = get_dpi_scale(overlay.hwnd());
+        let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+
+        let Coordinate {
+            x,
+            y,
+            width,
+            height,
+            icon_size,
+            item_size,
+        } = Coordinate::new(
+            state.apps.len() as i32,
+            icon_size_max,
+            border_size,
+            icon_border,
+        );
+
+        let colors = overlay.colors();
+        let hdc = overlay.hdc_screen;
+        overlay.render(x, y, width, height, dpi_scale, move |g| unsafe {
+            draw_panel_border(g, colors, width, height, dpi_scale);
+
+            // Rounded selection highlight behind the selected app.
+            let sel_left = (border_size + item_size * state.index as i32) as f32;
+            let sel_top = border_size as f32;
+            let sel_radius = (item_size as f32 / 4.0).min(8.0 * dpi_scale as f32);
+            fill_round_rect(
+                g,
+                colors.selection,
+                sel_left,
+                sel_top,
+                item_size as f32,
+                item_size as f32,
+                sel_radius,
+            );
+
+            // Icons. Build a correct premultiplied bitmap ourselves (GdipCreateBitmapFromHICON
+            // ignores the AND-mask for non-alpha icons and fills them with opaque black).
+            for (i, (icon, _)) in state.apps.iter().enumerate() {
+                let Some((iw, ih, buf)) = hicon_to_pbgra(hdc, *icon) else {
+                    continue;
+                };
+                let mut icon_ptr: *mut GpBitmap = std::ptr::null_mut();
+                if GdipCreateBitmapFromScan0(
+                    iw,
+                    ih,
+                    iw * 4,
+                    PIXEL_FORMAT_32BPP_PARGB,
+                    Some(buf.as_ptr()),
+                    &mut icon_ptr,
+                )
+                .0 != 0
+                    || icon_ptr.is_null()
+                {
+                    continue;
+                }
+                let ix = border_size + item_size * (i as i32) + icon_border;
+                let iy = border_size + icon_border;
+                GdipDrawImageRectI(g, icon_ptr as *mut GpImage, ix, iy, icon_size, icon_size);
+                GdipDisposeImage(icon_ptr as *mut GpImage);
+                // `buf` must outlive the draw above (GdipCreateBitmapFromScan0 does not copy).
+                drop(buf);
+            }
+        });
+    }
+
+    pub fn find_clicked_app_index(&self, overlay: &Overlay, state: &SwitchAppsState) -> Option<usize> {
         let cursor_pos = unsafe {
             let mut pos = POINT::default();
             let _ = GetCursorPos(&mut pos);
             pos
         };
 
-        let dpi_scale = get_dpi_scale(self.hwnd);
+        let dpi_scale = get_dpi_scale(overlay.hwnd());
         let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
         let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
         let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
@@ -557,14 +599,235 @@ impl GdiAAPainter {
     }
 }
 
-impl Drop for GdiAAPainter {
-    fn drop(&mut self) {
+/// The Alt+Ctrl+Tab current-app window switcher: a vertical list of rows, each a small app
+/// icon followed by the window title. Owns its GDI+ text objects (the shared `Overlay` owns
+/// the GDI+ runtime lifetime, so this must be dropped before the `Overlay`).
+pub struct WindowsPainter {
+    font_family: *mut GpFontFamily,
+    string_format: *mut GpStringFormat,
+    font: *mut GpFont,
+    font_dpi: f64,
+}
+
+impl WindowsPainter {
+    /// Must be constructed AFTER `Overlay::new` (which initializes GDI+).
+    pub fn new() -> Self {
+        let mut font_family: *mut GpFontFamily = std::ptr::null_mut();
+        let mut string_format: *mut GpStringFormat = std::ptr::null_mut();
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-            ReleaseDC(None, self.hdc_screen);
-            GdiplusShutdown(self.token);
+            // Failures leave null handles; text drawing is then skipped (icons still render).
+            GdipCreateFontFamilyFromName(w!("Segoe UI"), std::ptr::null_mut(), &mut font_family);
+            GdipCreateStringFormat(0, 0, &mut string_format);
+            if !string_format.is_null() {
+                GdipSetStringFormatAlign(string_format, StringAlignmentNear);
+                GdipSetStringFormatLineAlign(string_format, StringAlignmentCenter);
+                GdipSetStringFormatTrimming(string_format, StringTrimmingEllipsisCharacter);
+                GdipSetStringFormatFlags(string_format, StringFormatFlagsNoWrap.0);
+            }
         }
-        // Composition COM objects + dispatcher controller drop via field order.
+        Self {
+            font_family,
+            string_format,
+            font: std::ptr::null_mut(),
+            font_dpi: 0.0,
+        }
+    }
+
+    /// (Re)creates the font when the DPI changes (em-size is in pixels).
+    fn ensure_font(&mut self, dpi_scale: f64) {
+        if !self.font.is_null() && self.font_dpi == dpi_scale {
+            return;
+        }
+        unsafe {
+            if !self.font.is_null() {
+                GdipDeleteFont(self.font);
+                self.font = std::ptr::null_mut();
+            }
+            if !self.font_family.is_null() {
+                let em = FONT_SIZE_BASE * dpi_scale as f32;
+                let mut font: *mut GpFont = std::ptr::null_mut();
+                GdipCreateFont(self.font_family, em, FontStyleRegular.0, UnitPixel, &mut font);
+                self.font = font;
+            }
+        }
+        self.font_dpi = dpi_scale;
+    }
+
+    pub fn paint(&mut self, overlay: &mut Overlay, state: &SwitchAppWindowsState) {
+        let dpi_scale = get_dpi_scale(overlay.hwnd());
+        self.ensure_font(dpi_scale);
+
+        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let row_height = (ROW_HEIGHT_BASE as f64 * dpi_scale) as i32;
+        let row_icon = (ROW_ICON_SIZE_BASE as f64 * dpi_scale) as i32;
+        let pad = (ROW_TEXT_PAD_BASE as f64 * dpi_scale) as i32;
+
+        // Left edge of the title text column: border + pad + icon + pad.
+        let text_left = border_size + pad + row_icon + pad;
+        let measured = unsafe { self.measure_titles_width(&state.items) };
+        let min_w = (POPUP_MIN_WIDTH_BASE as f64 * dpi_scale) as i32;
+        let max_w = (POPUP_MAX_WIDTH_BASE as f64 * dpi_scale) as i32;
+        let width = (text_left + measured + pad).clamp(min_w, max_w);
+
+        let margin = Overlay::shadow_margin(dpi_scale);
+        let VCoordinate {
+            x,
+            y,
+            width,
+            height,
+            first_visible,
+            visible_rows,
+        } = VCoordinate::new(
+            state.items.len(),
+            state.index,
+            width,
+            border_size,
+            row_height,
+            margin,
+        );
+
+        let colors = overlay.colors();
+        let hdc = overlay.hdc_screen;
+        let font = self.font;
+        let fmt = self.string_format;
+        let items = &state.items;
+        let sel_index = state.index;
+
+        overlay.render(x, y, width, height, dpi_scale, move |g| unsafe {
+            GdipSetTextRenderingHint(g, TextRenderingHintAntiAlias);
+            draw_panel_border(g, colors, width, height, dpi_scale);
+
+            for row in 0..visible_rows {
+                let idx = first_visible + row;
+                let (icon, _, title) = &items[idx];
+                let row_top = border_size + row_height * row as i32;
+
+                // Selection highlight behind the current row.
+                if idx == sel_index {
+                    let inset = (3.0 * dpi_scale).round() as i32;
+                    let sel_radius = 6.0 * dpi_scale as f32;
+                    fill_round_rect(
+                        g,
+                        colors.selection,
+                        (border_size + inset) as f32,
+                        (row_top + inset) as f32,
+                        (width - 2 * (border_size + inset)) as f32,
+                        (row_height - 2 * inset) as f32,
+                        sel_radius,
+                    );
+                }
+
+                // App icon (vertically centered in the row).
+                if let Some((iw, ih, buf)) = hicon_to_pbgra(hdc, *icon) {
+                    let mut icon_ptr: *mut GpBitmap = std::ptr::null_mut();
+                    if GdipCreateBitmapFromScan0(
+                        iw,
+                        ih,
+                        iw * 4,
+                        PIXEL_FORMAT_32BPP_PARGB,
+                        Some(buf.as_ptr()),
+                        &mut icon_ptr,
+                    )
+                    .0 == 0
+                        && !icon_ptr.is_null()
+                    {
+                        let ix = border_size + pad;
+                        let iy = row_top + (row_height - row_icon) / 2;
+                        GdipDrawImageRectI(g, icon_ptr as *mut GpImage, ix, iy, row_icon, row_icon);
+                        GdipDisposeImage(icon_ptr as *mut GpImage);
+                    }
+                    drop(buf);
+                }
+
+                // Window title (left-aligned, vertically centered, ellipsized).
+                if !font.is_null() && !fmt.is_null() {
+                    let wide: Vec<u16> = title.encode_utf16().collect();
+                    let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+                    GdipCreateSolidFill(TITLE_TEXT_COLOR, &mut brush);
+                    let rect = RectF {
+                        X: text_left as f32,
+                        Y: row_top as f32,
+                        Width: (width - text_left - pad) as f32,
+                        Height: row_height as f32,
+                    };
+                    GdipDrawString(
+                        g,
+                        PCWSTR(wide.as_ptr()),
+                        wide.len() as i32,
+                        font,
+                        &rect,
+                        fmt,
+                        brush as *mut GpBrush,
+                    );
+                    GdipDeleteBrush(brush as *mut GpBrush);
+                    drop(wide);
+                }
+            }
+        });
+    }
+
+    /// Measures the widest title (px) using a throwaway GDI+ graphics, for popup width.
+    unsafe fn measure_titles_width(&self, items: &[(HICON, HWND, String)]) -> i32 {
+        unsafe {
+            if self.font.is_null() || self.string_format.is_null() {
+                return 0;
+            }
+            let mut bmp: *mut GpBitmap = std::ptr::null_mut();
+            if GdipCreateBitmapFromScan0(1, 1, 0, PIXEL_FORMAT_32BPP_PARGB, None, &mut bmp).0 != 0
+                || bmp.is_null()
+            {
+                return 0;
+            }
+            let mut g: *mut GpGraphics = std::ptr::null_mut();
+            GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
+
+            let layout = RectF {
+                X: 0.0,
+                Y: 0.0,
+                Width: 100_000.0,
+                Height: 1_000.0,
+            };
+            let mut max_w = 0.0f32;
+            for (_, _, title) in items {
+                let wide: Vec<u16> = title.encode_utf16().collect();
+                let mut bbox = RectF::default();
+                GdipMeasureString(
+                    g,
+                    PCWSTR(wide.as_ptr()),
+                    wide.len() as i32,
+                    self.font,
+                    &layout,
+                    self.string_format,
+                    &mut bbox,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                if bbox.Width > max_w {
+                    max_w = bbox.Width;
+                }
+            }
+
+            GdipDeleteGraphics(g);
+            GdipDisposeImage(bmp as *mut GpImage);
+            max_w.ceil() as i32
+        }
+    }
+}
+
+impl Drop for WindowsPainter {
+    fn drop(&mut self) {
+        // Must run before Overlay's GdiplusShutdown (guaranteed by App's field order).
+        unsafe {
+            if !self.font.is_null() {
+                GdipDeleteFont(self.font);
+            }
+            if !self.string_format.is_null() {
+                GdipDeleteStringFormat(self.string_format);
+            }
+            if !self.font_family.is_null() {
+                GdipDeleteFontFamily(self.font_family);
+            }
+        }
     }
 }
 
@@ -609,6 +872,41 @@ fn query_effects_supported(hwnd: HWND) -> Result<bool> {
         windows::core::factory::<CompositionCapabilities, ICompositionCapabilitiesInteropFactory>()?;
     let caps = unsafe { factory.GetForWindow(hwnd)? };
     Ok(caps.AreEffectsSupported()?)
+}
+
+/// Strokes the beveled rounded-rectangle outline of a pane (lit top-left, shadowed
+/// bottom-right) — shared by both popups.
+unsafe fn draw_panel_border(
+    g: *mut GpGraphics,
+    colors: SwitchAppsColors,
+    width: i32,
+    height: i32,
+    dpi_scale: f64,
+) {
+    unsafe {
+        // Rounded 1px stroke that follows the pane's rounded corners (a rectangular border
+        // would be clipped at the corners by the composition rounded clip).
+        let pen_width = (BORDER_WIDTH_BASE * dpi_scale as f32).max(1.0);
+        let w = width as f32;
+        let h = height as f32;
+        // Centered stroke inset by half its width so its OUTER edge sits flush on the pane
+        // edge (no sliver of tint showing outside the border).
+        let inset = pen_width * 0.5;
+        let corner = CORNER_RADIUS_BASE * dpi_scale as f32;
+        let blur = BORDER_BLUR_BASE * dpi_scale as f32;
+        stroke_round_rect(
+            g,
+            colors.border_light,
+            colors.border_dark,
+            inset,
+            inset,
+            w - 2.0 * inset,
+            h - 2.0 * inset,
+            (corner - inset).max(0.0),
+            pen_width,
+            blur,
+        );
+    }
 }
 
 /// Strokes a beveled rounded-rectangle outline: the top + left edges (and top-left corner)
@@ -811,6 +1109,7 @@ fn get_dpi_scale(hwnd: HWND) -> f64 {
     }
 }
 
+/// Horizontal layout for the Alt+Tab app row.
 struct Coordinate {
     x: i32,
     y: i32,
@@ -842,6 +1141,57 @@ impl Coordinate {
             height,
             icon_size,
             item_size,
+        }
+    }
+}
+
+/// Vertical layout for the Alt+Ctrl+Tab window list. When more rows exist than fit on the
+/// monitor, only a window of `visible_rows` (scrolled to keep `index` in view) is shown.
+struct VCoordinate {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    first_visible: usize,
+    visible_rows: usize,
+}
+
+impl VCoordinate {
+    fn new(
+        num_rows: usize,
+        index: usize,
+        width: i32,
+        border_size: i32,
+        row_height: i32,
+        margin: i32,
+    ) -> Self {
+        let monitor_rect = get_moinitor_rect();
+        let monitor_width = monitor_rect.right - monitor_rect.left;
+        let monitor_height = monitor_rect.bottom - monitor_rect.top;
+
+        // How many rows fit, leaving room for the border and the shadow margin.
+        let avail = (monitor_height - 2 * margin - 2 * border_size).max(row_height);
+        let max_rows = (avail / row_height).max(1) as usize;
+        let visible_rows = num_rows.min(max_rows).max(1);
+
+        let first_visible = if num_rows <= visible_rows {
+            0
+        } else {
+            let half = visible_rows / 2;
+            index.saturating_sub(half).min(num_rows - visible_rows)
+        };
+
+        let height = row_height * visible_rows as i32 + border_size * 2;
+        let x = monitor_rect.left + (monitor_width - width) / 2;
+        let y = monitor_rect.top + (monitor_height - height) / 2;
+
+        Self {
+            x,
+            y,
+            width,
+            height,
+            first_visible,
+            visible_rows,
         }
     }
 }

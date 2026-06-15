@@ -1,9 +1,12 @@
 use crate::{
     app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
-        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
+        WM_USER_SWITCH_APP_WINDOWS, WM_USER_SWITCH_APP_WINDOWS_CANCEL,
+        WM_USER_SWITCH_APP_WINDOWS_DONE, WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
     },
-    config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
+    config::{
+        Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_APP_WINDOWS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID,
+    },
     foreground::IS_FOREGROUND_IN_BLACKLIST,
 };
 
@@ -27,7 +30,12 @@ static KEYBOARD_STATE: LazyLock<Mutex<Vec<HotKeyState>>> = LazyLock::new(|| Mute
 static mut WINDOW: HWND = HWND(0 as _);
 static mut IS_SHIFT_PRESSED: bool = false;
 static mut IS_SWITCHING_APPS: bool = false;
+static mut IS_SWITCHING_APP_WINDOWS: bool = false;
 static mut PREVIOUS_KEYCODE: u32 = 0;
+/// The hotkey currently mid-gesture. `alt+tab` and `alt+ctrl+tab` share the `alt`
+/// modifier and the `Tab` code, so releasing `alt` would otherwise queue a *_DONE for
+/// both; only the active hotkey should commit.
+static mut ACTIVE_HOTKEY_ID: Option<u32> = None;
 
 #[derive(Debug)]
 pub struct KeyboardListener {
@@ -43,6 +51,7 @@ impl KeyboardListener {
             .map(|hotkey| HotKeyState {
                 hotkey: (*hotkey).clone(),
                 is_modifier_pressed: false,
+                is_modifier2_pressed: false,
             })
             .collect();
         *KEYBOARD_STATE.lock() = keyboard_state;
@@ -77,6 +86,15 @@ impl Drop for KeyboardListener {
 struct HotKeyState {
     hotkey: Hotkey,
     is_modifier_pressed: bool,
+    is_modifier2_pressed: bool,
+}
+
+impl HotKeyState {
+    /// Whether all required modifiers are currently held.
+    fn held(&self) -> bool {
+        self.is_modifier_pressed
+            && (self.hotkey.modifier2.is_none() || self.is_modifier2_pressed)
+    }
 }
 
 unsafe fn send_message_timeout(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
@@ -106,12 +124,29 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let mut send_action_message: Option<(u32, isize, bool)> = None;
 
     for state in keyboard_state.iter_mut() {
-        if state.hotkey.modifier.contains(&scan_code) {
+        let is_mod1 = state.hotkey.modifier.contains(&scan_code);
+        let is_mod2 = state
+            .hotkey
+            .modifier2
+            .map(|m| m.contains(&scan_code))
+            .unwrap_or(false);
+        if is_mod1 || is_mod2 {
             is_modifier = true;
             if is_key_pressed() {
-                state.is_modifier_pressed = true;
+                if is_mod1 {
+                    state.is_modifier_pressed = true;
+                }
+                if is_mod2 {
+                    state.is_modifier2_pressed = true;
+                }
             } else {
-                state.is_modifier_pressed = false;
+                if is_mod1 {
+                    state.is_modifier_pressed = false;
+                }
+                if is_mod2 {
+                    state.is_modifier2_pressed = false;
+                }
+                // Releasing ANY required modifier commits the gesture.
                 if PREVIOUS_KEYCODE == state.hotkey.code {
                     send_done_hotkeys.insert(state.hotkey.id);
                 }
@@ -120,24 +155,30 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     }
     if !is_modifier {
         for state in keyboard_state.iter_mut() {
-            if is_key_pressed() && state.is_modifier_pressed {
+            if is_key_pressed() && state.held() {
                 let id = state.hotkey.id;
                 if scan_code == state.hotkey.code {
                     let reverse = if IS_SHIFT_PRESSED { 1 } else { 0 };
                     if id == SWITCH_APPS_HOTKEY_ID
+                        || id == SWITCH_APP_WINDOWS_HOTKEY_ID
                         || (id == SWITCH_WINDOWS_HOTKEY_ID && !IS_FOREGROUND_IN_BLACKLIST)
                     {
                         send_action_message = Some((id, reverse, false));
                         PREVIOUS_KEYCODE = scan_code;
                         break;
                     };
-                } else if id == SWITCH_APPS_HOTKEY_ID {
+                } else if id == SWITCH_APPS_HOTKEY_ID || id == SWITCH_APP_WINDOWS_HOTKEY_ID {
+                    let is_switching = if id == SWITCH_APPS_HOTKEY_ID {
+                        IS_SWITCHING_APPS
+                    } else {
+                        IS_SWITCHING_APP_WINDOWS
+                    };
                     if scan_code == 0x01 {
                         // escape key
                         send_action_message = Some((id, 0, true));
                         PREVIOUS_KEYCODE = scan_code;
                         break;
-                    } else if [0x48, 0x4b, 0x4d, 0x50].contains(&scan_code) && IS_SWITCHING_APPS {
+                    } else if [0x48, 0x4b, 0x4d, 0x50].contains(&scan_code) && is_switching {
                         // arrow keys
                         let reverse = if scan_code == 0x48 || scan_code == 0x4b {
                             1
@@ -154,12 +195,20 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     drop(keyboard_state);
 
     for id in send_done_hotkeys {
+        // Only the active gesture commits (alt+tab and alt+ctrl+tab share alt + Tab).
+        if ACTIVE_HOTKEY_ID != Some(id) {
+            continue;
+        }
         if id == SWITCH_APPS_HOTKEY_ID {
             send_message_timeout(WINDOW, WM_USER_SWITCH_APPS_DONE, WPARAM(0), LPARAM(0));
             IS_SWITCHING_APPS = false;
+        } else if id == SWITCH_APP_WINDOWS_HOTKEY_ID {
+            send_message_timeout(WINDOW, WM_USER_SWITCH_APP_WINDOWS_DONE, WPARAM(0), LPARAM(0));
+            IS_SWITCHING_APP_WINDOWS = false;
         } else if id == SWITCH_WINDOWS_HOTKEY_ID {
             send_message_timeout(WINDOW, WM_USER_SWITCH_WINDOWS_DONE, WPARAM(0), LPARAM(0));
         }
+        ACTIVE_HOTKEY_ID = None;
     }
 
     if let Some((id, reverse, is_cancel)) = send_action_message {
@@ -167,14 +216,28 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
             if is_cancel {
                 send_message_timeout(WINDOW, WM_USER_SWITCH_APPS_CANCEL, WPARAM(0), LPARAM(0));
                 IS_SWITCHING_APPS = false;
+                ACTIVE_HOTKEY_ID = None;
             } else {
                 send_message_timeout(WINDOW, WM_USER_SWITCH_APPS, WPARAM(0), LPARAM(reverse));
                 IS_SWITCHING_APPS = true;
+                ACTIVE_HOTKEY_ID = Some(id);
+            }
+            return LRESULT(1);
+        } else if id == SWITCH_APP_WINDOWS_HOTKEY_ID {
+            if is_cancel {
+                send_message_timeout(WINDOW, WM_USER_SWITCH_APP_WINDOWS_CANCEL, WPARAM(0), LPARAM(0));
+                IS_SWITCHING_APP_WINDOWS = false;
+                ACTIVE_HOTKEY_ID = None;
+            } else {
+                send_message_timeout(WINDOW, WM_USER_SWITCH_APP_WINDOWS, WPARAM(0), LPARAM(reverse));
+                IS_SWITCHING_APP_WINDOWS = true;
+                ACTIVE_HOTKEY_ID = Some(id);
             }
             return LRESULT(1);
         } else if id == SWITCH_WINDOWS_HOTKEY_ID {
             send_message_timeout(WINDOW, WM_USER_SWITCH_WINDOWS, WPARAM(0), LPARAM(reverse));
             IS_SWITCHING_APPS = false;
+            ACTIVE_HOTKEY_ID = Some(id);
             return LRESULT(1);
         }
     }

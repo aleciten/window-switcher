@@ -1,7 +1,7 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
-use crate::painter::GdiAAPainter;
+use crate::painter::{AppsPainter, Overlay, WindowsPainter};
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
 use crate::utils::{
@@ -33,6 +33,9 @@ pub const WM_USER_SWITCH_APPS_DONE: u32 = 6011;
 pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
+pub const WM_USER_SWITCH_APP_WINDOWS: u32 = 6030;
+pub const WM_USER_SWITCH_APP_WINDOWS_DONE: u32 = 6031;
+pub const WM_USER_SWITCH_APP_WINDOWS_CANCEL: u32 = 6032;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -53,14 +56,20 @@ pub struct App {
     config: Config,
     switch_windows_state: SwitchWindowsState,
     switch_apps_state: Option<SwitchAppsState>,
+    switch_app_windows_state: Option<SwitchAppWindowsState>,
     cached_icons: HashMap<String, HICON>,
-    painter: GdiAAPainter,
+    apps_painter: AppsPainter,
+    // `windows_painter` is declared before `overlay` on purpose: it holds GDI+ font objects
+    // that must be freed (its Drop) before the overlay shuts GDI+ down (overlay's Drop).
+    windows_painter: WindowsPainter,
+    overlay: Overlay,
 }
 
 impl App {
     pub fn start(config: &Config) -> Result<()> {
         let hwnd = Self::create_window()?;
-        let painter = GdiAAPainter::new(hwnd, config.switch_apps_colors)?;
+        let overlay = Overlay::new(hwnd, config.switch_apps_colors)?;
+        let windows_painter = WindowsPainter::new();
 
         let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
         let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
@@ -86,8 +95,11 @@ impl App {
                 modifier_released: true,
             },
             switch_apps_state: None,
+            switch_app_windows_state: None,
             cached_icons: Default::default(),
-            painter,
+            apps_painter: AppsPainter,
+            windows_painter,
+            overlay,
         };
 
         app.set_trayicon();
@@ -223,7 +235,7 @@ impl App {
                 let reverse = lparam.0 == 1;
                 app.switch_apps(reverse)?;
                 if let Some(state) = &app.switch_apps_state {
-                    app.painter.paint(state);
+                    app.apps_painter.paint(&mut app.overlay, state);
                 }
             }
             WM_USER_SWITCH_APPS_DONE => {
@@ -252,6 +264,25 @@ impl App {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
                 let app = get_app(hwnd)?;
                 app.switch_windows_state.modifier_released = true;
+            }
+            WM_USER_SWITCH_APP_WINDOWS => {
+                debug!("message WM_USER_SWITCH_APP_WINDOWS");
+                let app = get_app(hwnd)?;
+                let reverse = lparam.0 == 1;
+                app.switch_app_windows(reverse)?;
+                if let Some(state) = &app.switch_app_windows_state {
+                    app.windows_painter.paint(&mut app.overlay, state);
+                }
+            }
+            WM_USER_SWITCH_APP_WINDOWS_DONE => {
+                debug!("message WM_USER_SWITCH_APP_WINDOWS_DONE");
+                let app = get_app(hwnd)?;
+                app.do_switch_app_window();
+            }
+            WM_USER_SWITCH_APP_WINDOWS_CANCEL => {
+                debug!("message WM_USER_SWITCH_APP_WINDOWS_CANCEL");
+                let app = get_app(hwnd)?;
+                app.cancel_switch_app_window();
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
@@ -445,7 +476,7 @@ impl App {
 
     fn click(&mut self) {
         if let Some(state) = self.switch_apps_state.as_mut() {
-            if let Some(i) = self.painter.find_clicked_app_index(state) {
+            if let Some(i) = self.apps_painter.find_clicked_app_index(&self.overlay, state) {
                 state.index = i;
                 self.do_switch_app();
             }
@@ -457,14 +488,108 @@ impl App {
             if let Some((_, id)) = state.apps.get(state.index) {
                 set_foreground_window(*id);
             }
-            self.painter.unpaint(state);
+            drop(state);
+            self.overlay.hide();
         }
     }
 
     fn cancel_switch_app(&mut self) {
-        if let Some(state) = self.switch_apps_state.take() {
-            self.painter.unpaint(state);
+        if self.switch_apps_state.take().is_some() {
+            self.overlay.hide();
         }
+    }
+
+    /// Builds (or advances) the vertical popup listing the current app's windows.
+    fn switch_app_windows(&mut self, reverse: bool) -> Result<()> {
+        if let Some(state) = self.switch_app_windows_state.as_mut() {
+            if reverse {
+                if state.index == 0 {
+                    state.index = state.items.len() - 1;
+                } else {
+                    state.index -= 1;
+                }
+            } else if state.index == state.items.len() - 1 {
+                state.index = 0;
+            } else {
+                state.index += 1;
+            }
+            debug!("switch app windows: new index:{}", state.index);
+            return Ok(());
+        }
+
+        let foreground = get_foreground_window();
+        let windows = list_windows(
+            self.config.switch_apps_ignore_minimal,
+            self.config.switch_apps_only_current_desktop(),
+            self.is_admin,
+        )?;
+        let (module_path, app_windows) = match windows
+            .iter()
+            .find(|(_, v)| v.iter().any(|(id, _)| *id == foreground))
+        {
+            Some((k, v)) => (k.clone(), v),
+            None => return Ok(()),
+        };
+
+        let module_hicon = *self
+            .cached_icons
+            .entry(module_path.clone())
+            .or_insert_with(|| {
+                get_app_icon(
+                    &self.config.switch_apps_override_icons,
+                    &module_path,
+                    foreground,
+                )
+            });
+
+        let items: Vec<(HICON, HWND, String)> = app_windows
+            .iter()
+            .map(|(id, title)| (module_hicon, *id, truncate_title(title)))
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let index = if items.len() == 1 {
+            0
+        } else if reverse {
+            items.len() - 1
+        } else {
+            1
+        };
+
+        self.switch_app_windows_state = Some(SwitchAppWindowsState { items, index });
+        debug!(
+            "switch app windows, new state:{:?}",
+            self.switch_app_windows_state
+        );
+        Ok(())
+    }
+
+    fn do_switch_app_window(&mut self) {
+        if let Some(state) = self.switch_app_windows_state.take() {
+            if let Some((_, id, _)) = state.items.get(state.index) {
+                set_foreground_window(*id);
+            }
+            drop(state);
+            self.overlay.hide();
+        }
+    }
+
+    fn cancel_switch_app_window(&mut self) {
+        if self.switch_app_windows_state.take().is_some() {
+            self.overlay.hide();
+        }
+    }
+}
+
+/// Caps a window title to a sane length for the popup (counted in chars, not bytes).
+fn truncate_title(title: &str) -> String {
+    const MAX_TITLE_CHARS: usize = 200;
+    if title.chars().count() > MAX_TITLE_CHARS {
+        title.chars().take(MAX_TITLE_CHARS).collect()
+    } else {
+        title.to_string()
     }
 }
 
@@ -496,5 +621,12 @@ struct SwitchWindowsState {
 #[derive(Debug)]
 pub struct SwitchAppsState {
     pub apps: Vec<(HICON, HWND)>,
+    pub index: usize,
+}
+
+#[derive(Debug)]
+pub struct SwitchAppWindowsState {
+    /// Each row: the (shared) app icon, the window handle, and its title.
+    pub items: Vec<(HICON, HWND, String)>,
     pub index: usize,
 }

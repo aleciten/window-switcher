@@ -37,7 +37,7 @@ use windows::Win32::{
             DIB_RGB_COLORS, HDC,
         },
         GdiPlus::{
-            FillModeAlternate, FontStyleRegular, GdipAddPathArc, GdipClosePathFigure,
+            FillModeAlternate, FontStyleBold, FontStyleRegular, GdipAddPathArc, GdipClosePathFigure,
             GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName,
             GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipCreateStringFormat,
             GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily, GdipDeleteGraphics,
@@ -74,8 +74,6 @@ use windows::Win32::{
 use windows_numerics::{Vector2, Vector3};
 
 pub const ICON_SIZE_BASE: i32 = 64;
-/// Margin between the pane edge and the icon list.
-pub const WINDOW_BORDER_SIZE_BASE: i32 = 16;
 /// Padding around each icon, i.e. the margin between apps in the list.
 pub const ICON_BORDER_SIZE_BASE: i32 = 14;
 
@@ -90,6 +88,18 @@ pub const ROW_TEXT_PAD_BASE: i32 = 10;
 pub const POPUP_BORDER_BASE: i32 = 6;
 /// Vertical gap above/below the selection highlight within a row.
 const ROW_SEL_INSET_BASE: i32 = 2;
+/// Padding between the app icon and the selection highlight around it (px @ 96dpi).
+/// Smaller than `ICON_BORDER_SIZE_BASE` so the cursor hugs the icon.
+const APP_CURSOR_PADDING_BASE: i32 = 6;
+/// Vertical margin between the app-switcher pane edge and the icon row (px @ 96dpi). Kept
+/// small so the pane is compact and the name label sits near the cursor.
+const APP_BORDER_SIZE_BASE: i32 = 8;
+/// Horizontal margin between the app-switcher pane edge and the icon row (px @ 96dpi).
+const APP_H_BORDER_SIZE_BASE: i32 = 16;
+/// Height of the app-switcher band that shows the selected app's name (px @ 96dpi).
+const APP_LABEL_HEIGHT_BASE: i32 = 14;
+/// Font em-size for the app-switcher name label (smaller than the window-list font).
+const APP_LABEL_FONT_BASE: f32 = 11.5;
 /// Font em-size (UnitPixel) for the window titles.
 const FONT_SIZE_BASE: f32 = 14.0;
 /// Min / max popup width clamp, in px @ 96dpi.
@@ -495,15 +505,30 @@ impl Drop for Overlay {
     }
 }
 
-/// The Alt+Tab app switcher: a horizontal row of app icons with a selection highlight.
-pub struct AppsPainter;
+/// The Alt+Tab app switcher: a horizontal row of app icons with a selection highlight and,
+/// in a band beneath the row, the selected app's name.
+pub struct AppsPainter {
+    label: TextRenderer,
+}
 
 impl AppsPainter {
-    pub fn paint(&self, overlay: &mut Overlay, state: &SwitchAppsState) {
+    /// Must be constructed AFTER `Overlay::new` (which initializes GDI+).
+    pub fn new() -> Self {
+        Self {
+            label: TextRenderer::new(true, true),
+        }
+    }
+
+    pub fn paint(&mut self, overlay: &mut Overlay, state: &SwitchAppsState) {
         let dpi_scale = get_dpi_scale(overlay.hwnd());
         let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
-        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border_h = (APP_H_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border_v = (APP_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
         let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let cursor_pad = (APP_CURSOR_PADDING_BASE as f64 * dpi_scale) as i32;
+        let label_height = (APP_LABEL_HEIGHT_BASE as f64 * dpi_scale) as i32;
+        self.label
+            .ensure_font(APP_LABEL_FONT_BASE * dpi_scale as f32, dpi_scale);
 
         let Coordinate {
             x,
@@ -515,32 +540,44 @@ impl AppsPainter {
         } = Coordinate::new(
             state.apps.len() as i32,
             icon_size_max,
-            border_size,
+            border_h,
+            border_v,
             icon_border,
+            label_height,
         );
 
         let colors = overlay.colors();
         let hdc = overlay.hdc_screen;
+        let label = &self.label;
+        let name = state.apps.get(state.index).map(|(_, _, n)| n.clone());
         overlay.render(x, y, width, height, dpi_scale, move |g| unsafe {
+            GdipSetTextRenderingHint(g, TextRenderingHintAntiAlias);
             draw_panel_border(g, colors, width, height, dpi_scale);
 
-            // Rounded selection highlight behind the selected app.
-            let sel_left = (border_size + item_size * state.index as i32) as f32;
-            let sel_top = border_size as f32;
-            let sel_radius = (item_size as f32 / 4.0).min(8.0 * dpi_scale as f32);
+            // The icon row + cursor are centered vertically in the window; the name label
+            // floats just below the cursor and does not affect this centering.
+            let row_top = (height - item_size) / 2;
+
+            // Rounded selection highlight behind the selected app, inset toward the icon so
+            // it hugs the icon rather than filling the whole item cell.
+            let sel_inset = icon_border - cursor_pad;
+            let sel_size = item_size - 2 * sel_inset;
+            let sel_left = (border_h + item_size * state.index as i32 + sel_inset) as f32;
+            let sel_top = (row_top + sel_inset) as f32;
+            let sel_radius = (sel_size as f32 / 4.0).min(8.0 * dpi_scale as f32);
             fill_round_rect(
                 g,
                 colors.selection,
                 sel_left,
                 sel_top,
-                item_size as f32,
-                item_size as f32,
+                sel_size as f32,
+                sel_size as f32,
                 sel_radius,
             );
 
             // Icons. Build a correct premultiplied bitmap ourselves (GdipCreateBitmapFromHICON
             // ignores the AND-mask for non-alpha icons and fills them with opaque black).
-            for (i, (icon, _)) in state.apps.iter().enumerate() {
+            for (i, (icon, _, _)) in state.apps.iter().enumerate() {
                 let Some((iw, ih, buf)) = hicon_to_pbgra(hdc, *icon) else {
                     continue;
                 };
@@ -558,12 +595,38 @@ impl AppsPainter {
                 {
                     continue;
                 }
-                let ix = border_size + item_size * (i as i32) + icon_border;
-                let iy = border_size + icon_border;
+                let ix = border_h + item_size * (i as i32) + icon_border;
+                let iy = row_top + icon_border;
                 GdipDrawImageRectI(g, icon_ptr as *mut GpImage, ix, iy, icon_size, icon_size);
                 GdipDisposeImage(icon_ptr as *mut GpImage);
                 // `buf` must outlive the draw above (GdipCreateBitmapFromScan0 does not copy).
                 drop(buf);
+            }
+
+            // The selected app's name, centered beneath its own icon. The band is wider than
+            // a single icon column so longer names fit before being ellipsized; it's centered
+            // on the icon and clamped to stay within the pane.
+            if let Some(name) = &name {
+                let sel_center = border_h + item_size * state.index as i32 + item_size / 2;
+                let avail = width - 2 * border_h;
+                // Keep the band symmetric around the icon center so the centered text
+                // stays under the selected icon. Near the edges we narrow it equally on
+                // both sides rather than sliding it sideways (which would drift the
+                // centered text onto the neighboring icon).
+                let desired_half = ((item_size * 3).min(avail) / 2).max(item_size / 2);
+                let half = desired_half
+                    .min(sel_center - border_h)
+                    .min(width - border_h - sel_center);
+                // Center the (vertically-centered) text in the gap between the cursor's
+                // bottom edge and the window's bottom edge.
+                let cursor_bottom = row_top + sel_inset + sel_size;
+                let rect = RectF {
+                    X: (sel_center - half) as f32,
+                    Y: cursor_bottom as f32,
+                    Width: (half * 2) as f32,
+                    Height: (height - cursor_bottom) as f32,
+                };
+                label.draw(g, name, TITLE_TEXT_COLOR, rect);
             }
         });
     }
@@ -577,24 +640,33 @@ impl AppsPainter {
 
         let dpi_scale = get_dpi_scale(overlay.hwnd());
         let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
-        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border_h = (APP_H_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border_v = (APP_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
         let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let label_height = (APP_LABEL_HEIGHT_BASE as f64 * dpi_scale) as i32;
 
         let Coordinate {
-            x, y, item_size, ..
+            x,
+            y,
+            height,
+            item_size,
+            ..
         } = Coordinate::new(
             state.apps.len() as i32,
             icon_size_max,
-            border_size,
+            border_h,
+            border_v,
             icon_border,
+            label_height,
         );
 
         let xpos = cursor_pos.x - x;
         let ypos = cursor_pos.y - y;
 
-        let cy = border_size;
+        // Must match the vertically-centered icon row in `paint`.
+        let cy = (height - item_size) / 2;
         for (i, _) in state.apps.iter().enumerate() {
-            let cx = border_size + item_size * (i as i32);
+            let cx = border_h + item_size * (i as i32);
             if xpos >= cx && xpos < cx + item_size && ypos >= cy && ypos < cy + item_size {
                 return Some(i);
             }
@@ -607,59 +679,21 @@ impl AppsPainter {
 /// icon followed by the window title. Owns its GDI+ text objects (the shared `Overlay` owns
 /// the GDI+ runtime lifetime, so this must be dropped before the `Overlay`).
 pub struct WindowsPainter {
-    font_family: *mut GpFontFamily,
-    string_format: *mut GpStringFormat,
-    font: *mut GpFont,
-    font_dpi: f64,
+    text: TextRenderer,
 }
 
 impl WindowsPainter {
     /// Must be constructed AFTER `Overlay::new` (which initializes GDI+).
     pub fn new() -> Self {
-        let mut font_family: *mut GpFontFamily = std::ptr::null_mut();
-        let mut string_format: *mut GpStringFormat = std::ptr::null_mut();
-        unsafe {
-            // Failures leave null handles; text drawing is then skipped (icons still render).
-            GdipCreateFontFamilyFromName(w!("Segoe UI"), std::ptr::null_mut(), &mut font_family);
-            GdipCreateStringFormat(0, 0, &mut string_format);
-            if !string_format.is_null() {
-                GdipSetStringFormatAlign(string_format, StringAlignmentNear);
-                GdipSetStringFormatLineAlign(string_format, StringAlignmentCenter);
-                GdipSetStringFormatTrimming(string_format, StringTrimmingEllipsisCharacter);
-                GdipSetStringFormatFlags(string_format, StringFormatFlagsNoWrap.0);
-            }
-        }
         Self {
-            font_family,
-            string_format,
-            font: std::ptr::null_mut(),
-            font_dpi: 0.0,
+            text: TextRenderer::new(false, false),
         }
-    }
-
-    /// (Re)creates the font when the DPI changes (em-size is in pixels).
-    fn ensure_font(&mut self, dpi_scale: f64) {
-        if !self.font.is_null() && self.font_dpi == dpi_scale {
-            return;
-        }
-        unsafe {
-            if !self.font.is_null() {
-                GdipDeleteFont(self.font);
-                self.font = std::ptr::null_mut();
-            }
-            if !self.font_family.is_null() {
-                let em = FONT_SIZE_BASE * dpi_scale as f32;
-                let mut font: *mut GpFont = std::ptr::null_mut();
-                GdipCreateFont(self.font_family, em, FontStyleRegular.0, UnitPixel, &mut font);
-                self.font = font;
-            }
-        }
-        self.font_dpi = dpi_scale;
     }
 
     pub fn paint(&mut self, overlay: &mut Overlay, state: &SwitchAppWindowsState) {
         let dpi_scale = get_dpi_scale(overlay.hwnd());
-        self.ensure_font(dpi_scale);
+        self.text
+            .ensure_font(FONT_SIZE_BASE * dpi_scale as f32, dpi_scale);
 
         let border = (POPUP_BORDER_BASE as f64 * dpi_scale) as i32;
         let row_height = (ROW_HEIGHT_BASE as f64 * dpi_scale) as i32;
@@ -670,7 +704,8 @@ impl WindowsPainter {
         // Horizontal bands within a row: [border][pad][icon][pad][title][pad][border].
         // The title column is bounded so the text never spills past the selection highlight.
         let text_left = border + pad + row_icon + pad;
-        let measured = unsafe { self.measure_titles_width(&state.items) };
+        let measured =
+            unsafe { self.text.measure_max_width(state.items.iter().map(|(_, _, t)| t.as_str())) };
         let min_w = (POPUP_MIN_WIDTH_BASE as f64 * dpi_scale) as i32;
         let max_w = (POPUP_MAX_WIDTH_BASE as f64 * dpi_scale) as i32;
         let width = (text_left + measured + pad + border).clamp(min_w, max_w);
@@ -694,8 +729,7 @@ impl WindowsPainter {
 
         let colors = overlay.colors();
         let hdc = overlay.hdc_screen;
-        let font = self.font;
-        let fmt = self.string_format;
+        let text = &self.text;
         let items = &state.items;
         let sel_index = state.index;
 
@@ -746,36 +780,113 @@ impl WindowsPainter {
 
                 // Window title (left-aligned, vertically centered, ellipsized). The right edge
                 // stops `pad` inside the selection so text never spills past the highlight.
-                if !font.is_null() && !fmt.is_null() {
-                    let wide: Vec<u16> = title.encode_utf16().collect();
-                    let mut brush: *mut GpSolidFill = std::ptr::null_mut();
-                    GdipCreateSolidFill(TITLE_TEXT_COLOR, &mut brush);
-                    let rect = RectF {
-                        X: text_left as f32,
-                        Y: row_top as f32,
-                        Width: (width - border - pad - text_left) as f32,
-                        Height: row_height as f32,
-                    };
-                    GdipDrawString(
-                        g,
-                        PCWSTR(wide.as_ptr()),
-                        wide.len() as i32,
-                        font,
-                        &rect,
-                        fmt,
-                        brush as *mut GpBrush,
-                    );
-                    GdipDeleteBrush(brush as *mut GpBrush);
-                    drop(wide);
-                }
+                let rect = RectF {
+                    X: text_left as f32,
+                    Y: row_top as f32,
+                    Width: (width - border - pad - text_left) as f32,
+                    Height: row_height as f32,
+                };
+                text.draw(g, title, TITLE_TEXT_COLOR, rect);
             }
         });
     }
 
-    /// Measures the widest title (px) using a throwaway GDI+ graphics, for popup width.
-    unsafe fn measure_titles_width(&self, items: &[(HICON, HWND, String)]) -> i32 {
+}
+
+/// Owns the GDI+ font + string-format for drawing one line of text into the overlay's DIB.
+/// The shared `Overlay` owns the GDI+ runtime, so a `TextRenderer` must be dropped before it
+/// (guaranteed by App's field order: the painters are declared before the overlay).
+struct TextRenderer {
+    family: *mut GpFontFamily,
+    format: *mut GpStringFormat,
+    font: *mut GpFont,
+    font_dpi: f64,
+    bold: bool,
+}
+
+impl TextRenderer {
+    /// `center` horizontally centers the text (otherwise left-aligns); always vertically
+    /// centered, single line, ellipsized on overflow. `bold` selects the bold weight.
+    /// Must be built AFTER `Overlay::new`.
+    fn new(center: bool, bold: bool) -> Self {
+        let mut family: *mut GpFontFamily = std::ptr::null_mut();
+        let mut format: *mut GpStringFormat = std::ptr::null_mut();
         unsafe {
-            if self.font.is_null() || self.string_format.is_null() {
+            // Failures leave null handles; text drawing is then skipped (icons still render).
+            GdipCreateFontFamilyFromName(w!("Segoe UI"), std::ptr::null_mut(), &mut family);
+            GdipCreateStringFormat(0, 0, &mut format);
+            if !format.is_null() {
+                let align = if center {
+                    StringAlignmentCenter
+                } else {
+                    StringAlignmentNear
+                };
+                GdipSetStringFormatAlign(format, align);
+                GdipSetStringFormatLineAlign(format, StringAlignmentCenter);
+                GdipSetStringFormatTrimming(format, StringTrimmingEllipsisCharacter);
+                GdipSetStringFormatFlags(format, StringFormatFlagsNoWrap.0);
+            }
+        }
+        Self {
+            family,
+            format,
+            font: std::ptr::null_mut(),
+            font_dpi: 0.0,
+            bold,
+        }
+    }
+
+    /// (Re)creates the font when the DPI changes (`em_px` is in pixels).
+    fn ensure_font(&mut self, em_px: f32, dpi_scale: f64) {
+        if !self.font.is_null() && self.font_dpi == dpi_scale {
+            return;
+        }
+        let style = if self.bold {
+            FontStyleBold
+        } else {
+            FontStyleRegular
+        };
+        unsafe {
+            if !self.font.is_null() {
+                GdipDeleteFont(self.font);
+                self.font = std::ptr::null_mut();
+            }
+            if !self.family.is_null() {
+                let mut font: *mut GpFont = std::ptr::null_mut();
+                GdipCreateFont(self.family, em_px, style.0, UnitPixel, &mut font);
+                self.font = font;
+            }
+        }
+        self.font_dpi = dpi_scale;
+    }
+
+    /// Draws `text` within `rect` (origin = pane top-left) in `color_argb`.
+    unsafe fn draw(&self, g: *mut GpGraphics, text: &str, color_argb: u32, rect: RectF) {
+        unsafe {
+            if self.font.is_null() || self.format.is_null() {
+                return;
+            }
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+            GdipCreateSolidFill(color_argb, &mut brush);
+            GdipDrawString(
+                g,
+                PCWSTR(wide.as_ptr()),
+                wide.len() as i32,
+                self.font,
+                &rect,
+                self.format,
+                brush as *mut GpBrush,
+            );
+            GdipDeleteBrush(brush as *mut GpBrush);
+            drop(wide);
+        }
+    }
+
+    /// Widest of `texts` in px, measured with a throwaway GDI+ graphics. 0 if unavailable.
+    unsafe fn measure_max_width<'a>(&self, texts: impl Iterator<Item = &'a str>) -> i32 {
+        unsafe {
+            if self.font.is_null() || self.format.is_null() {
                 return 0;
             }
             let mut bmp: *mut GpBitmap = std::ptr::null_mut();
@@ -794,8 +905,8 @@ impl WindowsPainter {
                 Height: 1_000.0,
             };
             let mut max_w = 0.0f32;
-            for (_, _, title) in items {
-                let wide: Vec<u16> = title.encode_utf16().collect();
+            for text in texts {
+                let wide: Vec<u16> = text.encode_utf16().collect();
                 let mut bbox = RectF::default();
                 GdipMeasureString(
                     g,
@@ -803,7 +914,7 @@ impl WindowsPainter {
                     wide.len() as i32,
                     self.font,
                     &layout,
-                    self.string_format,
+                    self.format,
                     &mut bbox,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -820,18 +931,17 @@ impl WindowsPainter {
     }
 }
 
-impl Drop for WindowsPainter {
+impl Drop for TextRenderer {
     fn drop(&mut self) {
-        // Must run before Overlay's GdiplusShutdown (guaranteed by App's field order).
         unsafe {
             if !self.font.is_null() {
                 GdipDeleteFont(self.font);
             }
-            if !self.string_format.is_null() {
-                GdipDeleteStringFormat(self.string_format);
+            if !self.format.is_null() {
+                GdipDeleteStringFormat(self.format);
             }
-            if !self.font_family.is_null() {
-                GdipDeleteFontFamily(self.font_family);
+            if !self.family.is_null() {
+                GdipDeleteFontFamily(self.family);
             }
         }
     }
@@ -1126,17 +1236,25 @@ struct Coordinate {
 }
 
 impl Coordinate {
-    fn new(num_apps: i32, icon_size_max: i32, border_size: i32, icon_border: i32) -> Self {
+    fn new(
+        num_apps: i32,
+        icon_size_max: i32,
+        border_h: i32,
+        border_v: i32,
+        icon_border: i32,
+        label_height: i32,
+    ) -> Self {
         let monitor_rect = get_moinitor_rect();
         let monitor_width = monitor_rect.right - monitor_rect.left;
         let monitor_height = monitor_rect.bottom - monitor_rect.top;
 
         let icon_size =
-            ((monitor_width - 2 * border_size) / num_apps - icon_border * 2).min(icon_size_max);
+            ((monitor_width - 2 * border_h) / num_apps - icon_border * 2).min(icon_size_max);
 
         let item_size = icon_size + icon_border * 2;
-        let width = item_size * num_apps + border_size * 2;
-        let height = item_size + border_size * 2;
+        let width = item_size * num_apps + border_h * 2;
+        // Top margin + icon row + name band + bottom margin (vertical margins top and bottom).
+        let height = border_v + item_size + label_height + border_v;
         let x = monitor_rect.left + (monitor_width - width) / 2;
         let y = monitor_rect.top + (monitor_height - height) / 2;
 

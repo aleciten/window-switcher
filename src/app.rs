@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW, LoadCursorW,
@@ -97,7 +98,7 @@ impl App {
             switch_apps_state: None,
             switch_app_windows_state: None,
             cached_icons: Default::default(),
-            apps_painter: AppsPainter,
+            apps_painter: AppsPainter::new(),
             windows_painter,
             overlay,
         };
@@ -255,7 +256,7 @@ impl App {
                 let hwnd = app
                     .switch_apps_state
                     .as_ref()
-                    .and_then(|state| state.apps.get(state.index).map(|(_, id)| *id))
+                    .and_then(|state| state.apps.get(state.index).map(|(_, id, _)| *id))
                     .unwrap_or_else(get_foreground_window);
                 app.switch_windows(hwnd, reverse)?;
                 app.cancel_switch_app();
@@ -438,11 +439,13 @@ impl App {
         )?;
         let mut apps = vec![];
         for (module_path, hwnds) in windows.iter() {
-            let module_hwnd = if is_iconic_window(hwnds[0].0) {
-                hwnds[hwnds.len() - 1].0
+            let (module_hwnd, rep_title) = if is_iconic_window(hwnds[0].0) {
+                let last = &hwnds[hwnds.len() - 1];
+                (last.0, last.1.as_str())
             } else {
-                hwnds[0].0
+                (hwnds[0].0, hwnds[0].1.as_str())
             };
+            let name = app_name(module_path, rep_title);
             let module_hicon = self
                 .cached_icons
                 .entry(module_path.clone())
@@ -453,7 +456,7 @@ impl App {
                         module_hwnd,
                     )
                 });
-            apps.push((*module_hicon, module_hwnd));
+            apps.push((*module_hicon, module_hwnd, name));
         }
         let num_apps = apps.len() as i32;
         if num_apps == 0 {
@@ -485,7 +488,7 @@ impl App {
 
     fn do_switch_app(&mut self) {
         if let Some(state) = self.switch_apps_state.take() {
-            if let Some((_, id)) = state.apps.get(state.index) {
+            if let Some((_, id, _)) = state.apps.get(state.index) {
                 set_foreground_window(*id);
             }
             drop(state);
@@ -626,6 +629,86 @@ fn strip_app_name<'a>(titles: impl IntoIterator<Item = &'a str>) -> Vec<String> 
         .collect()
 }
 
+/// Friendly application name for the app-switcher's selected-item label, taken from the
+/// executable's version resource (FileDescription, e.g. "Visual Studio Code", then
+/// ProductName). Falls back to the title's trailing " - <app>" segment, then the file stem.
+fn app_name(module_path: &str, title: &str) -> String {
+    if let Some(name) = exe_version_name(module_path) {
+        return name;
+    }
+    let from_title = title.rsplit(" - ").next().unwrap_or("").trim();
+    if !from_title.is_empty() {
+        return from_title.to_string();
+    }
+    let exe = exe_path(module_path);
+    let stem = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+    stem.strip_suffix(".exe")
+        .or_else(|| stem.strip_suffix(".EXE"))
+        .unwrap_or(stem)
+        .to_string()
+}
+
+/// The real executable path from a module key, dropping any browser-profile suffix
+/// (e.g. "chrome.exe::Profile2" -> "chrome.exe").
+fn exe_path(module_path: &str) -> &str {
+    module_path.split("::").next().unwrap_or(module_path)
+}
+
+/// Reads the executable's version resource and returns its FileDescription (preferred,
+/// the friendly name Explorer shows) or ProductName. `None` if the file has no version info.
+fn exe_version_name(module_path: &str) -> Option<String> {
+    let path = exe_path(module_path);
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let filename = PCWSTR(wide.as_ptr());
+    unsafe {
+        let size = GetFileVersionInfoSizeW(filename, None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        GetFileVersionInfoW(filename, None, size, data.as_mut_ptr() as *mut _).ok()?;
+        let block = data.as_ptr() as *const _;
+
+        // Languages to try: the file's own translations first, then English fallbacks.
+        let mut langs: Vec<(u16, u16)> = Vec::new();
+        let mut trans: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut trans_len: u32 = 0;
+        if VerQueryValueW(block, w!("\\VarFileInfo\\Translation"), &mut trans, &mut trans_len)
+            .as_bool()
+            && !trans.is_null()
+        {
+            let words = std::slice::from_raw_parts(trans as *const u16, (trans_len / 2) as usize);
+            for pair in words.chunks_exact(2) {
+                langs.push((pair[0], pair[1]));
+            }
+        }
+        langs.push((0x0409, 0x04b0)); // US English, Unicode
+        langs.push((0x0409, 0x04e4)); // US English, Windows multilingual
+
+        for field in ["FileDescription", "ProductName"] {
+            for (lang, cp) in &langs {
+                let sub = format!("\\StringFileInfo\\{lang:04x}{cp:04x}\\{field}");
+                let sub_w: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut val: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut val_len: u32 = 0;
+                if VerQueryValueW(block, PCWSTR(sub_w.as_ptr()), &mut val, &mut val_len).as_bool()
+                    && !val.is_null()
+                    && val_len > 0
+                {
+                    let chars = std::slice::from_raw_parts(val as *const u16, val_len as usize);
+                    let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                    let name = String::from_utf16_lossy(&chars[..end]);
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Caps a window title to a sane length for the popup (counted in chars, not bytes).
 fn truncate_title(title: &str) -> String {
     const MAX_TITLE_CHARS: usize = 200;
@@ -663,7 +746,8 @@ struct SwitchWindowsState {
 
 #[derive(Debug)]
 pub struct SwitchAppsState {
-    pub apps: Vec<(HICON, HWND)>,
+    /// Each app: its icon, a representative window handle, and the app's display name.
+    pub apps: Vec<(HICON, HWND, String)>,
     pub index: usize,
 }
 
